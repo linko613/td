@@ -3,7 +3,7 @@ name: Build Win32 tdjson.dll
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:  # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -12,7 +12,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install 32-bit dependencies (OpenSSL, zlib)
+    - name: Install gperf
+      run: |
+        choco install gperf
+
+    - name: Update vcpkg
+      run: |
+        git -C C:/vcpkg pull
+
+    - name: Install 32-bit dependencies
       run: |
         vcpkg install openssl[core]:x86-windows zlib:x86-windows
       env:
