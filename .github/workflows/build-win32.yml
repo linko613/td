@@ -18,11 +18,17 @@ jobs:
       with:
         cmake-version: '3.28'
 
+    - name: Install 32-bit dependencies
+      run: |
+        vcpkg install openssl[core]:x86-windows zlib:x86-windows
+      env:
+        VCPKG_ROOT: 'C:\vcpkg'
+
     - name: Configure CMake (Win32)
       run: |
         mkdir build32
         cd build32
-        cmake -G "Visual Studio 17 2022" -A Win32 ..
+        cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake ..
 
     - name: Build
       run: |
