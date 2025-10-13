@@ -2,9 +2,8 @@ name: Build Win32 tdjson.dll
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [ main, master ]
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
   build:
@@ -18,7 +17,7 @@ jobs:
       with:
         cmake-version: '3.28'
 
-    - name: Install 32-bit dependencies
+    - name: Install 32-bit dependencies (OpenSSL, zlib)
       run: |
         vcpkg install openssl[core]:x86-windows zlib:x86-windows
       env:
@@ -34,7 +33,7 @@ jobs:
       run: |
         cmake --build build32 --config Release
 
-    - name: Upload tdjson.dll
+    - name: Upload 32-bit tdjson.dll
       uses: actions/upload-artifact@v4
       with:
         name: tdjson-win32
