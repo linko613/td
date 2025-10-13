@@ -12,11 +12,6 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up CMake
-      uses: cmake/setup-cmake@v3
-      with:
-        cmake-version: '3.28'
-
     - name: Install 32-bit dependencies (OpenSSL, zlib)
       run: |
         vcpkg install openssl[core]:x86-windows zlib:x86-windows
