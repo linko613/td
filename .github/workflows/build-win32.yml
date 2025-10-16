@@ -1,4 +1,4 @@
-name: Build Win32 tdjson.dll (stdcall-export-only)
+name: Build Win32 tdjson.dll (Cached)
 
 on:
   push:
@@ -11,85 +11,81 @@ jobs:
     env:
       VCPKG_ROOT: 'C:\vcpkg'
       BUILD_DIR: 'build32'
-      VCPKG_TAG: '2024.09.12'
-      TDLIB_SOURCE_DIR: '.'  # TDLib源码根目录（根据实际调整，通常是仓库根目录）
+      VCPKG_TAG: '2024.09.12'  # vcpkg稳定版本标签
 
     steps:
-      - name: 检出代码（含TDLib源码）
+      - name: 检出TDLib源码（含子模块）
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'  # 关键：确保拉取TDLib完整源码（含子模块）
+          submodules: 'recursive'  # 拉取完整源码（含子模块）
 
-      - name: 安装gperf工具
+      # —— 缓存1：vcpkg依赖（避免重复安装） ——
+      - name: 缓存vcpkg依赖
+        uses: actions/cache@v3
+        id: cache-vcpkg
+        with:
+          path: |
+            ${{ env.VCPKG_ROOT }}
+            !${{ env.VCPKG_ROOT }}/buildtrees  # 排除临时构建目录（减小缓存体积）
+            !${{ env.VCPKG_ROOT }}/downloads   # 排除下载目录
+          key: vcpkg-x86-${{ env.VCPKG_TAG }}-${{ hashFiles('**/vcpkg.json') }}
+
+      - name: 安装gperf工具（仅缓存未命中时执行）
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: choco install gperf -y
 
-      - name: 清理并克隆vcpkg
+      - name: 初始化vcpkg（仅缓存未命中时执行）
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: |
-          if (Test-Path $env:VCPKG_ROOT) {
-            Remove-Item -Path $env:VCPKG_ROOT -Recurse -Force -ErrorAction SilentlyContinue
-          }
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           git -C $env:VCPKG_ROOT checkout tags/$env:VCPKG_TAG
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
 
-      - name: 缓存vcpkg依赖
-        uses: actions/cache@v3
-        with:
-          path: ${{ env.VCPKG_ROOT }}/installed
-          key: vcpkg-x86-${{ env.VCPKG_TAG }}-${{ hashFiles('**/vcpkg.json') }}
-          restore-keys: vcpkg-x86-${{ env.VCPKG_TAG }}-
-
-      - name: 安装32位依赖
-        run: |
-          vcpkg install openssl[core]:x86-windows zlib:x86-windows --clean-after-build
+      - name: 安装32位依赖（仅缓存未命中时执行）
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        run: vcpkg install openssl[core]:x86-windows zlib:x86-windows --clean-after-build
         env:
           VCPKG_DEFAULT_TRIPLET: x86-windows
 
-      - name: 配置CMake（修复参数格式+源码路径）
+      # —— 缓存2：CMake编译产物（避免重复编译） ——
+      - name: 缓存CMake构建产物
+        uses: actions/cache@v3
+        id: cache-build
+        with:
+          path: ${{ env.BUILD_DIR }}
+          key: cmake-build-win32-${{ github.sha }}  # 按提交哈希缓存，源码变则重新编译
+          restore-keys: cmake-build-win32-         # 回退到同分支最近缓存
+
+      - name: 配置+编译tdjson.dll（仅缓存未命中时执行）
+        if: steps.cache-build.outputs.cache-hit != 'true'
         run: |
-          # 创建构建目录
           mkdir -p $env:BUILD_DIR
-          # 进入构建目录
           cd $env:BUILD_DIR
-          # CMake命令（关键：用双引号包裹带空格的参数）
           cmake -G "Visual Studio 17 2022" -A Win32 `
             -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release `
-            "-DTD_JSON_CLIENT_API=__declspec(dllexport) __stdcall" `  # 修复：用双引号包裹带空格的定义
+            "-DTD_JSON_CLIENT_API=__declspec(dllexport) __stdcall" `
             -DTD_ENABLE_LTO=ON `
-            $env:TDLIB_SOURCE_DIR  # 显式指定源码目录（避免路径错误）
-
-      - name: 编译tdjson.dll
-        run: |
-          cmake --build $env:BUILD_DIR --config Release --parallel 4
+            ..
+          cmake --build . --config Release --parallel 4  # 并行编译加速
         timeout-minutes: 30
 
-      - name: 验证编译结果
+      - name: 验证tdjson.dll是否生成
         run: |
           if (-not (Test-Path "$env:BUILD_DIR\Release\tdjson.dll")) {
-            throw "tdjson.dll未生成"
-          }
-          $vcpkgBin = "${{ env.VCPKG_ROOT }}\installed\x86-windows\bin"
-          if (-not (Test-Path "$vcpkgBin\libcrypto-3.dll" -and Test-Path "$vcpkgBin\zlib1.dll")) {
-            throw "依赖缺失"
+            throw "编译失败：tdjson.dll未生成"
           }
 
-      - name: 复制依赖DLL
+      - name: 复制依赖DLL（OpenSSL + zlib）
         run: |
           $vcpkgBin = "${{ env.VCPKG_ROOT }}\installed\x86-windows\bin"
           $outputDir = "$env:BUILD_DIR\Release"
           Copy-Item "$vcpkgBin\libcrypto-3.dll" -Destination $outputDir -Force
           Copy-Item "$vcpkgBin\libssl-3.dll" -Destination $outputDir -Force
           Copy-Item "$vcpkgBin\zlib1.dll" -Destination $outputDir -Force
-          Get-ChildItem $outputDir -Filter *.dll | Select-Object Name
 
-      - name: 上传产物
+      - name: 上传最终产物（tdjson.dll + 依赖）
         uses: actions/upload-artifact@v4
         with:
           name: tdjson-win32-stdcall
-          path: |
-            ${{ env.BUILD_DIR }}/Release/tdjson.dll
-            ${{ env.BUILD_DIR }}/Release/libcrypto-3.dll
-            ${{ env.BUILD_DIR }}/Release/libssl-3.dll
-            ${{ env.BUILD_DIR }}/Release/zlib1.dll
-          retention-days: 7
+          path: ${{ env.BUILD_DIR }}/Release/*.dll
