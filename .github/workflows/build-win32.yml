@@ -3,84 +3,88 @@ name: Build Win32 tdjson.dll (stdcall)
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:  # 支持手动触发构建
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     env:
-      VCPKG_ROOT: 'C:\vcpkg'
+      VCPKG_ROOT: 'C:\vcpkg'  # 固定vcpkg路径
       BUILD_DIR: 'build32'
+      VCPKG_TAG: '2024.09.12'  # 使用vcpkg最新有效标签（可从官网确认）
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'  # 拉取TDLib子模块（如果需要）
+          submodules: 'recursive'
 
       - name: 安装gperf工具
         run: choco install gperf -y
 
-      - name: 安装并初始化vcpkg
+      - name: 清理并克隆vcpkg（解决目录已存在问题）
         run: |
+          # 若vcpkg目录已存在，先删除（避免冲突）
+          if (Test-Path $env:VCPKG_ROOT) {
+            Remove-Item -Path $env:VCPKG_ROOT -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          # 重新克隆vcpkg
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
-          git -C $env:VCPKG_ROOT checkout 2024.04.23  # 固定vcpkg版本，避免兼容性问题
-          .\$env:VCPKG_ROOT\bootstrap-vcpkg.bat
+          # 切换到有效标签（从vcpkg releases获取：https://github.com/microsoft/vcpkg/releases）
+          git -C $env:VCPKG_ROOT checkout tags/$env:VCPKG_TAG
+          # 初始化vcpkg（使用绝对路径）
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
 
-      - name: 缓存vcpkg依赖（加速构建）
+      - name: 缓存vcpkg依赖
         uses: actions/cache@v3
         with:
           path: ${{ env.VCPKG_ROOT }}/installed
-          key: vcpkg-x86-stdcall-${{ hashFiles('**/vcpkg.json') }}
-          restore-keys: vcpkg-x86-stdcall-
+          key: vcpkg-x86-stdcall-${{ env.VCPKG_TAG }}-${{ hashFiles('**/vcpkg.json') }}
+          restore-keys: vcpkg-x86-stdcall-${{ env.VCPKG_TAG }}-
 
-      - name: 安装32位依赖（OpenSSL + zlib）
+      - name: 安装32位依赖
         run: |
           vcpkg install openssl[core]:x86-windows zlib:x86-windows --clean-after-build
         env:
           VCPKG_DEFAULT_TRIPLET: x86-windows
 
-      - name: 配置CMake（强制stdcall约定）
+      - name: 配置CMake（强制stdcall）
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
           cmake -G "Visual Studio 17 2022" -A Win32 `
-            -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake `
+            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_CXX_FLAGS="/Gz" `  # 强制C++函数使用stdcall
-            -DCMAKE_C_FLAGS="/Gz" `    # 强制C函数使用stdcall
-            -DTD_ENABLE_LTO=ON `       # 启用链接优化
+            -DCMAKE_CXX_FLAGS="/Gz" `
+            -DCMAKE_C_FLAGS="/Gz" `
+            -DTD_ENABLE_LTO=ON `
             ..
 
       - name: 编译tdjson.dll
         run: |
-          cmake --build $env:BUILD_DIR --config Release --parallel 4  # 4线程并行编译
-        timeout-minutes: 30  # 超时保护
+          cmake --build $env:BUILD_DIR --config Release --parallel 4
+        timeout-minutes: 30
 
       - name: 验证编译结果
         run: |
-          # 检查tdjson.dll是否生成
           if (-not (Test-Path "$env:BUILD_DIR\Release\tdjson.dll")) {
-            throw "编译失败：tdjson.dll未生成"
+            throw "tdjson.dll未生成"
           }
-          # 检查依赖DLL
           $vcpkgBin = "${{ env.VCPKG_ROOT }}\installed\x86-windows\bin"
           if (-not (Test-Path "$vcpkgBin\libcrypto-3.dll" -and Test-Path "$vcpkgBin\zlib1.dll")) {
-            throw "依赖缺失：OpenSSL或zlib未安装"
+            throw "依赖缺失"
           }
 
-      - name: 复制依赖DLL到输出目录
+      - name: 复制依赖DLL
         run: |
           $vcpkgBin = "${{ env.VCPKG_ROOT }}\installed\x86-windows\bin"
           $outputDir = "$env:BUILD_DIR\Release"
-          # 复制OpenSSL和zlib依赖
           Copy-Item "$vcpkgBin\libcrypto-3.dll" -Destination $outputDir -Force
           Copy-Item "$vcpkgBin\libssl-3.dll" -Destination $outputDir -Force
           Copy-Item "$vcpkgBin\zlib1.dll" -Destination $outputDir -Force
-          # 列出输出目录的DLL，确认复制成功
           Get-ChildItem $outputDir -Filter *.dll
 
-      - name: 上传构建产物（含stdcall版本tdjson.dll及依赖）
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: tdjson-win32-stdcall
@@ -89,4 +93,4 @@ jobs:
             ${{ env.BUILD_DIR }}/Release/libcrypto-3.dll
             ${{ env.BUILD_DIR }}/Release/libssl-3.dll
             ${{ env.BUILD_DIR }}/Release/zlib1.dll
-          retention-days: 7  # 产物保留7天
+          retention-days: 7
