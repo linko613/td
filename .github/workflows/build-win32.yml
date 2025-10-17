@@ -1,4 +1,4 @@
-name: Build tdjson.dll (Fix CMake Parameter)
+name: Build tdjson.dll (Fix Stdcall Conflict)
 
 on:
   workflow_dispatch:
@@ -12,10 +12,10 @@ jobs:
       VCPKG_TAG: '2024.09.12'
 
     steps:
-      - name: 检出TDLib源码（含子模块，确保CMakeLists.txt存在）
+      - name: 检出TDLib源码（含子模块）
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'  # 关键：确保根目录有CMakeLists.txt
+          submodules: 'recursive'  # 确保源码完整
 
       - name: 缓存vcpkg依赖
         uses: actions/cache@v3
@@ -25,7 +25,7 @@ jobs:
             ${{ env.VCPKG_ROOT }}
             !${{ env.VCPKG_ROOT }}/buildtrees
             !${{ env.VCPKG_ROOT }}/downloads
-          key: vcpkg-x86-params-${{ env.VCPKG_TAG }}
+          key: vcpkg-x86-conflict-${{ env.VCPKG_TAG }}
 
       - name: 安装依赖（缓存未命中时）
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
@@ -43,36 +43,43 @@ jobs:
         id: cache-build
         with:
           path: ${{ env.BUILD_DIR }}
-          key: tdjson-params-${{ github.sha }}
+          key: tdjson-conflict-${{ github.sha }}
 
-      - name: 配置+编译（单行CMake命令，避免参数拆分）
+      - name: 配置+编译（仅导出函数用stdcall，移除全局强制）
         if: steps.cache-build.outputs.cache-hit != 'true'
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
-          # 核心：所有参数写在单行，带空格的参数用引号包裹，明确指定源码目录为..
-          cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release "-DTD_JSON_CLIENT_API=__declspec(dllexport) __stdcall" -DCMAKE_C_FLAGS="/Gz" -DCMAKE_CXX_FLAGS="/Gz" ..
-          # 编译并输出详细日志
-          cmake --build . --config Release --parallel 4 --verbose
+          # 关键修改：1. 移除全局/Gz选项 2. 确保TD_JSON_CLIENT_API宏传递给tdjson目标
+          cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release "-DTD_JSON_CLIENT_API=__declspec(dllexport) __stdcall" ..
+          # 编译tdjson目标（优先编译核心DLL，避免无关目标报错）
+          cmake --build . --config Release --parallel 4 --target tdjson --verbose
         timeout-minutes: 45
 
-      - name: 检查目录结构（调试用）
-        run: |
-          Write-Host "build目录结构："
-          Get-ChildItem -Path $env:BUILD_DIR -Recurse | Select-Object FullName
-
-      - name: 验证tdjson.dll生成
+      - name: 检查tdjson.dll是否生成
         run: |
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
           if (-not (Test-Path $dllPath)) {
             throw "tdjson.dll未生成，路径：$dllPath"
+          } else {
+            Write-Host "✅ tdjson.dll生成成功"
           }
 
-      - name: 检查导出函数（确保stdcall）
+      - name: 验证导出函数（确保带@后缀，stdcall生效）
         run: |
           $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe"
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
-          & $dumpbin /exports $dllPath | Select-String -Pattern "td_json_client_"
+          $exports = & $dumpbin /exports $dllPath | Select-String -Pattern "td_json_client_"
+          if (-not $exports) {
+            throw "❌ 未找到td_json_client_系列导出函数"
+          }
+          # 检查是否带@后缀（stdcall标志）
+          $hasStdcall = $exports | Select-String -Pattern "@\d+" -Quiet
+          if ($hasStdcall) {
+            Write-Host "✅ 导出函数带@后缀，stdcall生效：`n$exports"
+          } else {
+            Write-Warning "⚠️  导出函数无@后缀，需确认调用约定"
+          }
 
       - name: 复制依赖DLL
         run: |
@@ -82,8 +89,8 @@ jobs:
           Copy-Item "$vcpkgBin\libssl-3.dll" -Destination $outputDir -Force
           Copy-Item "$vcpkgBin\zlib1.dll" -Destination $outputDir -Force
 
-      - name: 上传产物
+      - name: 上传最终产物
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-win32-params-fixed
+          name: tdjson-win32-stdcall-fixed
           path: ${{ env.BUILD_DIR }}/Release/*.dll
