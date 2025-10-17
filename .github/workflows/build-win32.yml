@@ -1,4 +1,4 @@
-name: Build Win32 tdjson.dll
+name: Build Win32 tdjson.dll with __stdcall
 
 on:
   push:
@@ -24,20 +24,18 @@ jobs:
       env:
         VCPKG_ROOT: 'C:\vcpkg'
 
-    - name: Configure CMake (Fixed Syntax)
+    - name: Configure CMake (Fixed Format)
       run: |
         mkdir build32
         cd build32
-        $cmakeArgs = @(
-          "-G Visual Studio 17 2022",
-          "-A Win32",
-          "-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake",
-          "-DCMAKE_CXX_FLAGS=`"/Gz`"",
-          "-DCMAKE_C_FLAGS=`"/Gz`"",
-          "-DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE",
-          ".."
-        )
-        cmake ($cmakeArgs -join " ")  # 关键修复：避免^换行符错误[1][3]
+        cmake `
+          -G "Visual Studio 17 2022" `
+          -A Win32 `
+          -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
+          -DCMAKE_CXX_FLAGS="/Gz" `
+          -DCMAKE_C_FLAGS="/Gz" `
+          -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE `
+          ..
 
     - name: Build DLL
       run: |
@@ -46,17 +44,20 @@ jobs:
     - name: Copy dependencies
       run: |
         $vcpkgBin = "C:\vcpkg\installed\x86-windows\bin"
-        $outDir = "$pwd\build32\Release"
+        $outDir = "build32\Release"
         Copy-Item "$vcpkgBin\libcrypto-3.dll" $outDir
         Copy-Item "$vcpkgBin\libssl-3.dll" $outDir
         Copy-Item "$vcpkgBin\zlib1.dll" $outDir
-        # 添加VC++运行时
-        Copy-Item "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\**\x86\*.dll" $outDir -Recurse -Force
+
+        # 添加VS2022运行时库
+        $vcRedist = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC"
+        $latestVer = Get-ChildItem -Path $vcRedist -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        Copy-Item "$($latestVer.FullName)\x86\*.dll" $outDir
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: tdjson_win32
+        name: tdjson_win32_stdcall
         path: |
           build32/Release/tdjson.dll
           build32/Release/*.dll
