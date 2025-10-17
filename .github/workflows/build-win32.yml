@@ -1,4 +1,4 @@
-name: Build tdjson.dll (Force Stdcall Export)
+name: Build tdjson.dll (Fix CMake Parameter Parsing)
 
 on:
   workflow_dispatch:
@@ -12,10 +12,10 @@ jobs:
       VCPKG_TAG: '2024.09.12'
 
     steps:
-      - name: 检出TDLib源码
+      - name: 检出TDLib源码（确保CMakeLists.txt存在）
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: 'recursive'  # 关键：根目录必须有CMakeLists.txt
 
       - name: 缓存vcpkg依赖
         uses: actions/cache@v3
@@ -25,7 +25,7 @@ jobs:
             ${{ env.VCPKG_ROOT }}
             !${{ env.VCPKG_ROOT }}/buildtrees
             !${{ env.VCPKG_ROOT }}/downloads
-          key: vcpkg-x86-force-${{ env.VCPKG_TAG }}
+          key: vcpkg-x86-parse-${{ env.VCPKG_TAG }}
 
       - name: 安装依赖
         if: steps.cache-vcpkg.outputs.cache-hit != 'true'
@@ -43,43 +43,31 @@ jobs:
         id: cache-build
         with:
           path: ${{ env.BUILD_DIR }}
-          key: tdjson-force-${{ github.sha }}
+          key: tdjson-parse-${{ github.sha }}
 
-      - name: 配置+编译（只为tdjson目标启用stdcall）
+      - name: 配置+编译（单行命令，避免参数拆分）
         if: steps.cache-build.outputs.cache-hit != 'true'
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
-          # 关键：1. 传递导出宏 2. 只为Release模式的C/CXX启用/Gz（仅作用于编译的tdjson目标）
-          cmake -G "Visual Studio 17 2022" -A Win32 `
-            -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DTD_JSON_CLIENT_API="__declspec(dllexport) __stdcall" `  # 显式指定导出宏
-            -DCMAKE_CXX_FLAGS_Release="/Gz" `  # 仅Release模式C++代码用stdcall
-            -DCMAKE_C_FLAGS_Release="/Gz" `    # 仅Release模式C代码用stdcall
-            ..
-          # 只编译tdjson目标（不编译其他冲突目标，如tl-parser）
+          # 核心：所有参数写在单行，明确指定源码目录为..（父目录）
+          cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release "-DTD_JSON_CLIENT_API=__declspec(dllexport) __stdcall" -DCMAKE_CXX_FLAGS_Release="/Gz" -DCMAKE_C_FLAGS_Release="/Gz" ..
+          # 只编译tdjson目标
           cmake --build . --config Release --parallel 4 --target tdjson --verbose
         timeout-minutes: 45
 
-      - name: 强制验证stdcall（无@后缀则失败）
+      - name: 验证tdjson.dll及导出函数
         run: |
-          $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe"
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
+          if (-not (Test-Path $dllPath)) { throw "tdjson.dll未生成：$dllPath" }
           
-          if (-not (Test-Path $dllPath)) { throw "tdjson.dll未生成" }
+          $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe"
+          $exports = & $dumpbin /exports $dllPath | Select-String -Pattern "td_json_client_"
+          if (-not $exports) { throw "未找到核心导出函数" }
           
-          # 提取td_json_client_系列函数的导出信息
-          $exportLines = & $dumpbin /exports $dllPath | Select-String -Pattern "td_json_client_"
-          if (-not $exportLines) { throw "未找到核心导出函数" }
-          
-          # 检查是否有@数字后缀（stdcall标志）
-          $stdcallCount = ($exportLines | Select-String -Pattern "@\d+").Count
-          if ($stdcallCount -eq 0) {
-            throw "❌ 导出函数无@后缀，stdcall未生效！导出信息：`n$exportLines"
-          } else {
-            Write-Host "✅ 成功！$stdcallCount 个核心函数带@后缀（stdcall生效）：`n$exportLines"
-          }
+          $hasStdcall = $exports | Select-String -Pattern "@\d+" -Quiet
+          if (-not $hasStdcall) { throw "❌ 导出函数无@后缀，stdcall未生效：`n$exports" }
+          Write-Host "✅ 导出函数带@后缀，验证通过：`n$exports"
 
       - name: 复制依赖DLL
         run: |
@@ -89,8 +77,8 @@ jobs:
           Copy-Item "$vcpkgBin\libssl-3.dll" -Destination $outputDir -Force
           Copy-Item "$vcpkgBin\zlib1.dll" -Destination $outputDir -Force
 
-      - name: 上传验证通过的产物
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-win32-stdcall-validated
+          name: tdjson-win32-parse-fixed
           path: ${{ env.BUILD_DIR }}/Release/*.dll
