@@ -1,87 +1,93 @@
-name: Build Win32 tdjson.dll
+name: 编译 tdjson.dll（带@后缀的stdcall版本）
 
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # 固定路径，避免PowerShell解析问题
+      VCPKG_ROOT: C:\vcpkg
+      BUILD_DIR: build32
+      VCPKG_TAG: 2024.09.12
+      # 明确VS工具链路径（避免版本问题）
+      MSVC_VERSION: 14.44.35207
+      DUMPBIN_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: 检出TDLib源码（确保完整）
+        uses: actions/checkout@v4
+        with:
+          repository: tdlib/td  # 直接指定官方仓库，避免源码问题
+          submodules: recursive
+          fetch-depth: 1
 
-    - name: Install gperf
-      run: |
-        choco install gperf -y
+      - name: 缓存vcpkg（避免重复安装）
+        uses: actions/cache@v3
+        id: cache-vcpkg
+        with:
+          path: ${{ env.VCPKG_ROOT }}
+          key: vcpkg-tdjson-stdcall-final
 
-    - name: Setup vcpkg
-      run: |
-        git clone https://github.com/microsoft/vcpkg C:\vcpkg
-        C:\vcpkg\bootstrap-vcpkg.bat
+      - name: 安装vcpkg及依赖
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        run: |
+          # 安装必要工具
+          choco install gperf -y
+          # 克隆vcpkg并切换到稳定版本
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout tags/$env:VCPKG_TAG
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
+          # 安装32位依赖
+          vcpkg install openssl:x86-windows zlib:x86-windows --no-print-usage
 
-    - name: Install 32-bit dependencies
-      run: |
-        C:\vcpkg\vcpkg install openssl:x86-windows zlib:x86-windows
-      env:
-        VCPKG_ROOT: 'C:\vcpkg'
+      - name: 清理旧编译目录（避免缓存冲突）
+        run: |
+          if (Test-Path $env:BUILD_DIR) { Remove-Item -Recurse -Force $env:BUILD_DIR }
+          mkdir -p $env:BUILD_DIR
 
-    - name: Configure CMake (Win32)
-      run: |
-        mkdir build32
-        cd build32
-        cmake `
-          -G "Visual Studio 17 2022" `
-          -A Win32 `
-          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
-          -DCMAKE_BUILD_TYPE=Release `
-          -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE `
-          ..
+      - name: 配置CMake（单行命令，强制导出约定）
+        run: |
+          cd $env:BUILD_DIR
+          # 核心命令：所有参数单行传递，仅对tdjson导出函数用stdcall
+          cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -DTD_JSON_CLIENT_API="__declspec(dllexport) __stdcall" -DCMAKE_CXX_FLAGS="/EHsc" -DCMAKE_C_FLAGS="/EHsc" ..
+          # 检查CMake配置是否成功
+          if (-not (Test-Path "CMakeCache.txt")) { throw "CMake配置失败，未生成缓存文件" }
 
-    - name: Build tdjson.dll
-      run: |
-        cmake --build build32 --config Release
+      - name: 编译tdjson（仅核心目标，避免冲突）
+        run: |
+          cd $env:BUILD_DIR
+          # 只编译tdjson.dll，跳过其他可能冲突的目标
+          cmake --build . --config Release --target tdjson --parallel 4 --verbose
+          # 检查编译产物是否存在
+          $dllPath = "Release\tdjson.dll"
+          if (-not (Test-Path $dllPath)) { throw "编译失败，tdjson.dll未生成" }
 
-    - name: Copy dependencies (Fix VS Path)
-      run: |
-        $vcpkgBin = "C:\vcpkg\installed\x86-windows\bin"
-        $outDir = "build32\Release"
+      - name: 强制验证@后缀（不通过则失败）
+        run: |
+          $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
+          # 使用dumpbin检查导出函数
+          $exports = & "$env:DUMPBIN_PATH" /exports $dllPath | Select-String "td_json_client_"
+          if (-not $exports) { throw "未找到td_json_client_系列函数" }
+          # 必须包含@数字后缀（stdcall标志）
+          $hasStdcall = $exports | Select-String "@\d+" -Quiet
+          if (-not $hasStdcall) {
+            throw "❌ 导出函数无@后缀！当前导出：`n$exports`n请检查CMake参数是否生效"
+          } else {
+            Write-Host "✅ 验证通过！导出函数带@后缀：`n$exports"
+          }
 
-        # 复制 OpenSSL 和 Zlib
-        Copy-Item "$vcpkgBin\libcrypto-3.dll" $outDir
-        Copy-Item "$vcpkgBin\libssl-3.dll" $outDir
-        Copy-Item "$vcpkgBin\zlib1.dll" $outDir
+      - name: 复制依赖库（确保可运行）
+        run: |
+          $outputDir = "$env:BUILD_DIR\Release"
+          $vcpkgBin = "$env:VCPKG_ROOT\installed\x86-windows\bin"
+          Copy-Item "$vcpkgBin\libcrypto-3.dll" $outputDir -Force
+          Copy-Item "$vcpkgBin\libssl-3.dll" $outputDir -Force
+          Copy-Item "$vcpkgBin\zlib1.dll" $outputDir -Force
 
-        # 正确获取 MSVC Redist 路径（GitHub Actions 使用 Enterprise）
-        $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise"
-        if (-Not (Test-Path $vsPath)) {
-            Write-Host "Enterprise not found, trying Community..."
-            $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community"
-        }
-
-        if (-Not (Test-Path $vsPath)) {
-            Write-Error "Visual Studio not found!"
-            exit 1
-        }
-
-        $msvcRedist = "$vsPath\VC\Redist\MSVC"
-        if (-Not (Test-Path $msvcRedist)) {
-            Write-Error "MSVC redistributable directory not found at $msvcRedist"
-            exit 1
-        }
-
-        # 获取最新版本文件夹（按名称降序排序）
-        $latestVer = Get-ChildItem -Path $msvcRedist -Directory | Sort-Object Name -Descending | Select-Object -First 1
-        $redistPath = "$($latestVer.FullName)\x86\"
-
-        Write-Host "Copying VC++ runtime from: $redistPath"
-        Copy-Item "$redistPath\*.dll" $outDir -Force
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: tdjson-win32-release
-        path: |
-          build32/Release/tdjson.dll
-          build32/Release/*.dll
+      - name: 上传最终可用产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tdjson-stdcall-with-atsign
+          path: ${{ env.BUILD_DIR }}/Release/*.dll
