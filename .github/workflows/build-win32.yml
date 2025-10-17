@@ -1,8 +1,8 @@
-name: Build Win32 tdjson.dll with __stdcall
+name: Build Win32 tdjson.dll
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -12,52 +12,60 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install tools
+    - name: Install gperf
       run: |
         choco install gperf -y
+
+    - name: Setup vcpkg
+      run: |
         git clone https://github.com/microsoft/vcpkg C:\vcpkg
         C:\vcpkg\bootstrap-vcpkg.bat
 
-    - name: Install dependencies
+    - name: Install 32-bit dependencies
       run: |
         C:\vcpkg\vcpkg install openssl:x86-windows zlib:x86-windows
       env:
         VCPKG_ROOT: 'C:\vcpkg'
 
-    - name: Configure CMake (Fixed Format)
+    - name: Configure CMake (Win32)
       run: |
         mkdir build32
         cd build32
         cmake `
           -G "Visual Studio 17 2022" `
           -A Win32 `
-          -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
-          -DCMAKE_CXX_FLAGS="/Gz" `
-          -DCMAKE_C_FLAGS="/Gz" `
+          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+          -DCMAKE_BUILD_TYPE=Release `
           -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE `
           ..
 
-    - name: Build DLL
+    - name: Build tdjson.dll
       run: |
         cmake --build build32 --config Release
 
-    - name: Copy dependencies
+    - name: Copy required DLLs
       run: |
         $vcpkgBin = "C:\vcpkg\installed\x86-windows\bin"
         $outDir = "build32\Release"
+        
+        # Copy OpenSSL and Zlib runtime libraries
         Copy-Item "$vcpkgBin\libcrypto-3.dll" $outDir
         Copy-Item "$vcpkgBin\libssl-3.dll" $outDir
         Copy-Item "$vcpkgBin\zlib1.dll" $outDir
 
-        # 添加VS2022运行时库
-        $vcRedist = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC"
-        $latestVer = Get-ChildItem -Path $vcRedist -Directory | Sort-Object Name -Descending | Select-Object -First 1
-        Copy-Item "$($latestVer.FullName)\x86\*.dll" $outDir
+        # Auto-detect and copy MSVC runtime DLLs
+        $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise"
+        if (-Not (Test-Path $vsPath)) {
+          $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community"
+        }
+        $msvcRedist = "$vsPath\VC\Redist\MSVC"
+        $latest = Get-ChildItem -Path $msvcRedist -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        Copy-Item "$($latest.FullName)\x86\*.dll" $outDir -Exclude "*satellite*"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: tdjson_win32_stdcall
+        name: tdjson-win32-release
         path: |
           build32/Release/tdjson.dll
           build32/Release/*.dll
