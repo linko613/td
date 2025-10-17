@@ -43,24 +43,40 @@ jobs:
       run: |
         cmake --build build32 --config Release
 
-    - name: Copy required DLLs
+    - name: Copy dependencies (Fix VS Path)
       run: |
         $vcpkgBin = "C:\vcpkg\installed\x86-windows\bin"
         $outDir = "build32\Release"
-        
-        # Copy OpenSSL and Zlib runtime libraries
+
+        # 复制 OpenSSL 和 Zlib
         Copy-Item "$vcpkgBin\libcrypto-3.dll" $outDir
         Copy-Item "$vcpkgBin\libssl-3.dll" $outDir
         Copy-Item "$vcpkgBin\zlib1.dll" $outDir
 
-        # Auto-detect and copy MSVC runtime DLLs
+        # 正确获取 MSVC Redist 路径（GitHub Actions 使用 Enterprise）
         $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Enterprise"
         if (-Not (Test-Path $vsPath)) {
-          $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community"
+            Write-Host "Enterprise not found, trying Community..."
+            $vsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community"
         }
+
+        if (-Not (Test-Path $vsPath)) {
+            Write-Error "Visual Studio not found!"
+            exit 1
+        }
+
         $msvcRedist = "$vsPath\VC\Redist\MSVC"
-        $latest = Get-ChildItem -Path $msvcRedist -Directory | Sort-Object Name -Descending | Select-Object -First 1
-        Copy-Item "$($latest.FullName)\x86\*.dll" $outDir -Exclude "*satellite*"
+        if (-Not (Test-Path $msvcRedist)) {
+            Write-Error "MSVC redistributable directory not found at $msvcRedist"
+            exit 1
+        }
+
+        # 获取最新版本文件夹（按名称降序排序）
+        $latestVer = Get-ChildItem -Path $msvcRedist -Directory | Sort-Object Name -Descending | Select-Object -First 1
+        $redistPath = "$($latestVer.FullName)\x86\"
+
+        Write-Host "Copying VC++ runtime from: $redistPath"
+        Copy-Item "$redistPath\*.dll" $outDir -Force
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
