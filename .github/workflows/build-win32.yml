@@ -1,4 +1,4 @@
-name: 编译 tdjson.dll（.def 文件强制 stdcall）
+name: 编译 tdjson.dll（修正参数字节数）
 
 on:
   workflow_dispatch:
@@ -19,38 +19,44 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: 1. 创建模块定义文件（.def）强制 stdcall
+      - name: 1. 生成正确的 .def 文件（精确计算参数字节数）
         run: |
-          # 在 td/telegram 目录下创建 tdjson.def，明确指定导出函数及参数个数（用于生成@后缀）
+          # 32位下参数字节数计算：指针=4字节，double=8字节
           $defPath = "td/telegram/tdjson.def"
           @"
           LIBRARY tdjson.dll
           EXPORTS
-              td_json_client_create@0
-              td_json_client_destroy@4
-              td_json_client_send@8
-              td_json_client_receive@8
-              td_json_client_execute@8
+              td_json_client_create@0                ; 无参数 → 0字节
+              td_json_client_destroy@4               ; 1个void* → 4字节
+              td_json_client_send@8                  ; 2个指针（void*, char*）→ 4+4=8字节
+              td_json_client_receive@12              ; 1个指针（4）+ 1个double（8）→ 12字节（关键修正！）
+              td_json_client_execute@8               ; 2个指针 → 4+4=8字节
           "@ | Set-Content $defPath -Force
-          Write-Host "✅ 已创建 tdjson.def，强制指定导出函数及@后缀"
+          Write-Host "✅ 已生成修正后的 tdjson.def（参数字节数精确计算）"
 
-      - name: 2. 修改 CMakeLists.txt 引入 .def 文件
+      - name: 2. 彻底修改 CMakeLists，强制链接 .def 并禁用原有导出
         run: |
-          # 定位 td/telegram/CMakeLists.txt，添加 .def 文件到链接选项
           $cmakePath = "td/telegram/CMakeLists.txt"
           $content = Get-Content $cmakePath -Raw
-          # 在 tdjson 目标的 add_library 后添加链接 .def 文件
+
+          # 步骤1：移除原有导出宏（避免与.def冲突）
+          $content = $content -replace 'TD_JSON_CLIENT_API', ''
+
+          # 步骤2：在tdjson目标中强制添加.def文件和链接选项
           $content = $content -replace 'add_library\(tdjson SHARED .*\)', @"
           add_library(tdjson SHARED
               `$<TARGET_OBJECTS:tdjson_objects>
               td_json_client.cpp
               ../generate/auto/td/telegram/td_api.cpp
               ../generate/auto/td/telegram/td_api.hpp
-              tdjson.def  # 添加 .def 文件
+              tdjson.def  # 强制包含.def文件
           )
+          # 强制链接器使用.def文件（覆盖其他导出方式）
+          target_link_options(tdjson PRIVATE "/DEF:`${CMAKE_CURRENT_SOURCE_DIR}/tdjson.def")
           "@
+
           $content | Set-Content $cmakePath -Force
-          Write-Host "✅ 已修改 CMakeLists.txt，引入 tdjson.def"
+          Write-Host "✅ 已修改CMakeLists，禁用原有导出并强制链接.def"
 
       - name: 3. 安装依赖
         run: |
@@ -60,16 +66,16 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --no-print-usage
 
-      - name: 4. 清理并创建编译目录
+      - name: 4. 清理编译目录
         run: |
           if (Test-Path $env:BUILD_DIR) { Remove-Item -Recurse -Force $env:BUILD_DIR }
           mkdir -p $env:BUILD_DIR
 
-      - name: 5. 配置 CMake（单行命令）
-        run: cd $env:BUILD_DIR; cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release ..
+      - name: 5. 配置 CMake（禁用默认导出）
+        run: cd $env:BUILD_DIR; cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -DTD_JSON_CLIENT_API="" ..
 
-      - name: 6. 编译 tdjson（仅核心目标）
-        run: cd $env:BUILD_DIR; cmake --build . --config Release --target tdjson --parallel 4 --verbose
+      - name: 6. 编译 tdjson（带详细链接日志）
+        run: cd $env:BUILD_DIR; cmake --build . --config Release --target tdjson --parallel 4 --verbose > build.log 2>&1; type build.log  # 输出链接日志便于排查
 
       - name: 7. 验证 @ 后缀（必须存在）
         run: |
@@ -79,18 +85,15 @@ jobs:
           $exports = & "$env:DUMPBIN_PATH" /exports $dllPath | Select-String "td_json_client_"
           $hasStdcall = $exports | Select-String "@\d+" -Quiet
           if (-not $hasStdcall) {
-            throw "❌ 仍无@后缀！导出：`n$exports"
+            throw "❌ 仍无@后缀！导出：`n$exports`n请查看编译日志中的链接步骤"
           } else {
             Write-Host "✅ 成功！带@后缀的导出：`n$exports"
           }
 
-      - name: 8. 复制依赖
-        run: |
-          $out = "$env:BUILD_DIR\Release"
-          Copy-Item "$env:VCPKG_ROOT\installed\x86-windows\bin\*.dll" $out -Force
-
-      - name: 9. 上传最终产物
+      - name: 8. 上传产物和日志
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-with-atsign-def
-          path: ${{ env.BUILD_DIR }}/Release/*.dll
+          name: tdjson-final-with-def-logs
+          path: |
+            ${{ env.BUILD_DIR }}/Release/*.dll
+            ${{ env.BUILD_DIR }}/build.log
