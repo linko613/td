@@ -1,4 +1,4 @@
-name: 编译 tdjson.dll（修正参数字节数）
+name: 编译 tdjson.dll（修正路径+容错检查）
 
 on:
   workflow_dispatch:
@@ -19,44 +19,70 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: 1. 生成正确的 .def 文件（精确计算参数字节数）
+      - name: 确认源码结构（关键路径检查）
         run: |
-          # 32位下参数字节数计算：指针=4字节，double=8字节
-          $defPath = "td/telegram/tdjson.def"
+          # 列出根目录文件，确认TDLib结构
+          Write-Host "根目录文件列表："
+          Get-ChildItem -Path . -Recurse -Name | Select-String "telegram/CMakeLists.txt"
+          
+          # 修正CMakeLists.txt路径（根据实际结构调整）
+          $possiblePaths = @(
+            "td/telegram/CMakeLists.txt",  # 标准结构
+            "telegram/CMakeLists.txt"      # 可能的简化结构
+          )
+          $cmakePath = $null
+          foreach ($p in $possiblePaths) {
+            if (Test-Path $p) {
+              $cmakePath = $p
+              break
+            }
+          }
+          if (-not $cmakePath) {
+            throw "❌ 未找到telegram/CMakeLists.txt，请检查源码结构"
+          }
+          Write-Host "✅ 找到CMakeLists.txt：$cmakePath"
+          echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV  # 存入环境变量
+
+      - name: 1. 生成正确的 .def 文件（修正参数字节数）
+        run: |
+          # 确定def文件存放位置（与td_json_client.h同目录）
+          $defDir = Split-Path $env:CMAKE_PATH -Parent
+          $defPath = "$defDir/tdjson.def"
+          
           @"
           LIBRARY tdjson.dll
           EXPORTS
               td_json_client_create@0                ; 无参数 → 0字节
               td_json_client_destroy@4               ; 1个void* → 4字节
-              td_json_client_send@8                  ; 2个指针（void*, char*）→ 4+4=8字节
-              td_json_client_receive@12              ; 1个指针（4）+ 1个double（8）→ 12字节（关键修正！）
-              td_json_client_execute@8               ; 2个指针 → 4+4=8字节
+              td_json_client_send@8                  ; 2个指针 → 4+4=8字节
+              td_json_client_receive@12              ; void* (4) + double (8) → 12字节
+              td_json_client_execute@8               ; 2个指针 → 8字节
           "@ | Set-Content $defPath -Force
-          Write-Host "✅ 已生成修正后的 tdjson.def（参数字节数精确计算）"
+          Write-Host "✅ 已生成.def文件：$defPath"
+          echo "DEF_PATH=$defPath" >> $env:GITHUB_ENV
 
-      - name: 2. 彻底修改 CMakeLists，强制链接 .def 并禁用原有导出
+      - name: 2. 修改 CMakeLists，强制链接 .def
         run: |
-          $cmakePath = "td/telegram/CMakeLists.txt"
+          $cmakePath = $env:CMAKE_PATH
           $content = Get-Content $cmakePath -Raw
 
-          # 步骤1：移除原有导出宏（避免与.def冲突）
+          # 移除原有导出宏，避免冲突
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
 
-          # 步骤2：在tdjson目标中强制添加.def文件和链接选项
+          # 强制添加.def文件并设置链接选项
           $content = $content -replace 'add_library\(tdjson SHARED .*\)', @"
           add_library(tdjson SHARED
               `$<TARGET_OBJECTS:tdjson_objects>
               td_json_client.cpp
               ../generate/auto/td/telegram/td_api.cpp
               ../generate/auto/td/telegram/td_api.hpp
-              tdjson.def  # 强制包含.def文件
+              $($env:DEF_PATH)  # 引用生成的.def文件
           )
-          # 强制链接器使用.def文件（覆盖其他导出方式）
           target_link_options(tdjson PRIVATE "/DEF:`${CMAKE_CURRENT_SOURCE_DIR}/tdjson.def")
           "@
 
           $content | Set-Content $cmakePath -Force
-          Write-Host "✅ 已修改CMakeLists，禁用原有导出并强制链接.def"
+          Write-Host "✅ 已修改CMakeLists：$cmakePath"
 
       - name: 3. 安装依赖
         run: |
@@ -71,13 +97,13 @@ jobs:
           if (Test-Path $env:BUILD_DIR) { Remove-Item -Recurse -Force $env:BUILD_DIR }
           mkdir -p $env:BUILD_DIR
 
-      - name: 5. 配置 CMake（禁用默认导出）
+      - name: 5. 配置 CMake（单行命令）
         run: cd $env:BUILD_DIR; cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -DTD_JSON_CLIENT_API="" ..
 
-      - name: 6. 编译 tdjson（带详细链接日志）
-        run: cd $env:BUILD_DIR; cmake --build . --config Release --target tdjson --parallel 4 --verbose > build.log 2>&1; type build.log  # 输出链接日志便于排查
+      - name: 6. 编译 tdjson（带日志）
+        run: cd $env:BUILD_DIR; cmake --build . --config Release --target tdjson --parallel 4 --verbose > build.log 2>&1; type build.log
 
-      - name: 7. 验证 @ 后缀（必须存在）
+      - name: 7. 验证 @ 后缀
         run: |
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
           if (-not (Test-Path $dllPath)) { throw "tdjson.dll 未生成" }
@@ -85,7 +111,7 @@ jobs:
           $exports = & "$env:DUMPBIN_PATH" /exports $dllPath | Select-String "td_json_client_"
           $hasStdcall = $exports | Select-String "@\d+" -Quiet
           if (-not $hasStdcall) {
-            throw "❌ 仍无@后缀！导出：`n$exports`n请查看编译日志中的链接步骤"
+            throw "❌ 无@后缀！导出：`n$exports"
           } else {
             Write-Host "✅ 成功！带@后缀的导出：`n$exports"
           }
@@ -93,7 +119,7 @@ jobs:
       - name: 8. 上传产物和日志
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-final-with-def-logs
+          name: tdjson-path-fixed-final
           path: |
             ${{ env.BUILD_DIR }}/Release/*.dll
             ${{ env.BUILD_DIR }}/build.log
