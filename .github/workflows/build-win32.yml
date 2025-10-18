@@ -1,4 +1,4 @@
-name: 编译 tdjson.dll（单行命令终极版）
+name: 编译 tdjson.dll（.def 文件强制 stdcall）
 
 on:
   workflow_dispatch:
@@ -12,26 +12,47 @@ jobs:
       DUMPBIN_PATH: C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe
 
     steps:
-      - name: 检出TDLib源码
+      - name: 检出 TDLib 源码
         uses: actions/checkout@v4
         with:
           repository: tdlib/td
           submodules: recursive
           fetch-depth: 1
 
-      - name: 强制修改源码添加__stdcall（直接声明层面）
+      - name: 1. 创建模块定义文件（.def）强制 stdcall
         run: |
-          $header = "td/telegram/td_json_client.h"
-          (Get-Content $header -Raw) `
-            -replace 'TD_JSON_CLIENT_API void \*td_json_client_create\(\)', 'TD_JSON_CLIENT_API __declspec(dllexport) __stdcall void *td_json_client_create()' `
-            -replace 'TD_JSON_CLIENT_API void td_json_client_destroy\(void \*client\)', 'TD_JSON_CLIENT_API __declspec(dllexport) __stdcall void td_json_client_destroy(void *client)' `
-            -replace 'TD_JSON_CLIENT_API void td_json_client_send\(void \*client, const char \*request\)', 'TD_JSON_CLIENT_API __declspec(dllexport) __stdcall void td_json_client_send(void *client, const char *request)' `
-            -replace 'TD_JSON_CLIENT_API const char \*td_json_client_receive\(void \*client, double timeout\)', 'TD_JSON_CLIENT_API __declspec(dllexport) __stdcall const char *td_json_client_receive(void *client, double timeout)' `
-            -replace 'TD_JSON_CLIENT_API const char \*td_json_client_execute\(void \*client, const char \*request\)', 'TD_JSON_CLIENT_API __declspec(dllexport) __stdcall const char *td_json_client_execute(void *client, const char *request)' `
-            | Set-Content $header -Force
-          Write-Host "✅ 已修改td_json_client.h，强制添加__stdcall"
+          # 在 td/telegram 目录下创建 tdjson.def，明确指定导出函数及参数个数（用于生成@后缀）
+          $defPath = "td/telegram/tdjson.def"
+          @"
+          LIBRARY tdjson.dll
+          EXPORTS
+              td_json_client_create@0
+              td_json_client_destroy@4
+              td_json_client_send@8
+              td_json_client_receive@8
+              td_json_client_execute@8
+          "@ | Set-Content $defPath -Force
+          Write-Host "✅ 已创建 tdjson.def，强制指定导出函数及@后缀"
 
-      - name: 安装vcpkg及依赖
+      - name: 2. 修改 CMakeLists.txt 引入 .def 文件
+        run: |
+          # 定位 td/telegram/CMakeLists.txt，添加 .def 文件到链接选项
+          $cmakePath = "td/telegram/CMakeLists.txt"
+          $content = Get-Content $cmakePath -Raw
+          # 在 tdjson 目标的 add_library 后添加链接 .def 文件
+          $content = $content -replace 'add_library\(tdjson SHARED .*\)', @"
+          add_library(tdjson SHARED
+              `$<TARGET_OBJECTS:tdjson_objects>
+              td_json_client.cpp
+              ../generate/auto/td/telegram/td_api.cpp
+              ../generate/auto/td/telegram/td_api.hpp
+              tdjson.def  # 添加 .def 文件
+          )
+          "@
+          $content | Set-Content $cmakePath -Force
+          Write-Host "✅ 已修改 CMakeLists.txt，引入 tdjson.def"
+
+      - name: 3. 安装依赖
         run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
@@ -39,36 +60,37 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --no-print-usage
 
-      - name: 清理并创建编译目录
+      - name: 4. 清理并创建编译目录
         run: |
           if (Test-Path $env:BUILD_DIR) { Remove-Item -Recurse -Force $env:BUILD_DIR }
           mkdir -p $env:BUILD_DIR
 
-      - name: 配置CMake（纯单行命令，无换行）
-        run: cd $env:BUILD_DIR; cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release -DTD_JSON_CLIENT_API="__stdcall" -DCMAKE_CXX_FLAGS_Release="/Gz" -DCMAKE_C_FLAGS_Release="/Gz" ..
+      - name: 5. 配置 CMake（单行命令）
+        run: cd $env:BUILD_DIR; cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release ..
 
-      - name: 编译tdjson（仅核心目标）
+      - name: 6. 编译 tdjson（仅核心目标）
         run: cd $env:BUILD_DIR; cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
-      - name: 验证tdjson.dll生成
+      - name: 7. 验证 @ 后缀（必须存在）
         run: |
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
-          if (-not (Test-Path $dllPath)) { throw "tdjson.dll未生成：$dllPath" }
-
-      - name: 验证@后缀（必须存在）
-        run: |
-          $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
+          if (-not (Test-Path $dllPath)) { throw "tdjson.dll 未生成" }
+          
           $exports = & "$env:DUMPBIN_PATH" /exports $dllPath | Select-String "td_json_client_"
-          if (-not ($exports | Select-String "@\d+")) { throw "❌ 无@后缀！导出：`n$exports" }
-          Write-Host "✅ 成功！带@后缀的导出：`n$exports"
+          $hasStdcall = $exports | Select-String "@\d+" -Quiet
+          if (-not $hasStdcall) {
+            throw "❌ 仍无@后缀！导出：`n$exports"
+          } else {
+            Write-Host "✅ 成功！带@后缀的导出：`n$exports"
+          }
 
-      - name: 复制依赖
+      - name: 8. 复制依赖
         run: |
           $out = "$env:BUILD_DIR\Release"
           Copy-Item "$env:VCPKG_ROOT\installed\x86-windows\bin\*.dll" $out -Force
 
-      - name: 上传产物
+      - name: 9. 上传最终产物
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-final-working
+          name: tdjson-with-atsign-def
           path: ${{ env.BUILD_DIR }}/Release/*.dll
