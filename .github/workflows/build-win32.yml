@@ -1,4 +1,4 @@
-name: 彻底解决路径问题 - 易语言32位DLL
+name: 只认核心文件 - 彻底解决路径问题
 
 on:
   workflow_dispatch:
@@ -9,48 +9,63 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # 彻底简化路径：仓库根目录直接包含所有文件（无嵌套td子目录）
-      MAIN_CMAKE: CMakeLists.txt  # 仓库根目录的CMakeLists.txt
-      TELEGRAM_SRC: telegram      # 仓库根目录下的telegram目录
+      # 核心文件：生成tdjson.dll必须有这个文件，不管在哪个目录
+      CORE_FILE: td_json_client.cpp
 
     steps:
-      - name: 1. 检出仓库（linko613/td）
+      - name: 1. 检出仓库
         uses: actions/checkout@v4
         with:
           repository: linko613/td
           submodules: recursive
           fetch-depth: 0
 
-      - name: 2. 强制拉取子模块（最后一次）
+      - name: 2. 强制拉取子模块
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive --force
-          # 打印仓库根目录所有文件（关键：让你看到实际结构）
-          Write-Host "`n===== 仓库根目录文件列表 ====="
-          Get-ChildItem -Path . | Select-Object Name
 
-      - name: 3. 检查根目录CMakeLists.txt（最终路径）
+      - name: 3. 搜索核心文件td_json_client.cpp（不管目录名）
         run: |
-          if (-not (Test-Path $env:MAIN_CMAKE)) {
-            # 打印所有可能的CMakeLists.txt位置
-            Write-Host "`n===== 仓库中所有CMakeLists.txt的位置 ====="
-            Get-ChildItem -Path . -Recurse -Filter "CMakeLists.txt" | Select-Object FullName
-            throw "❌ 最后尝试：未找到$env:MAIN_CMAKE，请根据上面的列表修改MAIN_CMAKE"
+          Write-Host "`n===== 开始搜索核心文件$env:CORE_FILE ====="
+          $coreFilePath = (Get-ChildItem -Path . -Recurse -Filter $env:CORE_FILE | Select-Object -First 1).FullName
+          
+          if (-not $coreFilePath) {
+            throw "❌ 仓库中找不到$env:CORE_FILE！这是生成tdjson.dll的必须文件，请确认仓库完整"
           }
-          Write-Host "✅ 找到根目录CMakeLists.txt：$env:MAIN_CMAKE"
+          
+          # 提取核心文件所在目录（不管叫什么名字）
+          $coreDir = Split-Path $coreFilePath -Parent
+          Write-Host "✅ 找到核心文件：$coreFilePath"
+          Write-Host "核心文件所在目录：$coreDir"
+          
+          # 保存路径（不关心目录名，只认实际位置）
+          echo "CORE_DIR=$coreDir" >> $env:GITHUB_ENV
+          echo "CORE_FILE_PATH=$coreFilePath" >> $env:GITHUB_ENV
 
-      - name: 4. 检查telegram目录（根目录下）
+      - name: 4. 搜索主CMakeLists.txt（生成项目必须）
         run: |
-          if (-not (Test-Path $env:TELEGRAM_SRC)) {
-            Write-Host "`n===== 仓库中所有子目录 ====="
-            Get-ChildItem -Path . -Directory -Recurse | Select-Object FullName
-            throw "❌ 未找到$env:TELEGRAM_SRC，请根据上面的列表修改TELEGRAM_SRC"
+          Write-Host "`n===== 开始搜索主CMakeLists.txt ====="
+          $cmakePath = (Get-ChildItem -Path . -Recurse -Filter "CMakeLists.txt" | Where-Object { 
+            # 简单判断：包含add_library(tdjson的CMake才是目标
+            (Get-Content $_.FullName -Raw) -match "add_library\(tdjson" 
+          } | Select-Object -First 1).FullName
+          
+          if (-not $cmakePath) {
+            \# 退而求其次：找根目录的CMakeLists.txt
+            $cmakePath = (Get-ChildItem -Path . -Filter "CMakeLists.txt" | Select-Object -First 1).FullName
           }
-          Write-Host "✅ 找到telegram目录：$env:TELEGRAM_SRC"
+          
+          if (-not $cmakePath) {
+            throw "❌ 找不到CMakeLists.txt，无法编译"
+          }
+          
+          Write-Host "✅ 找到主CMakeLists.txt：$cmakePath"
+          echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
 
-      - name: 5. 生成.def文件（根目录/telegram下）
+      - name: 5. 在核心文件目录生成.def文件（不关心目录名）
         run: |
-          $defPath = "$env:TELEGRAM_SRC/tdjson.def"
+          $defPath = "$env:CORE_DIR/tdjson.def"
           @"
           LIBRARY tdjson.dll
           EXPORTS
@@ -61,14 +76,16 @@ jobs:
               td_json_client_execute@8
           "@ | Set-Content $defPath -Force
           echo "DEF_PATH=$defPath" >> $env:GITHUB_ENV
+          Write-Host "生成.def文件：$defPath"
 
-      - name: 6. 修改根目录CMakeLists.txt
+      - name: 6. 修改找到的CMakeLists.txt
         run: |
-          $content = Get-Content $env:MAIN_CMAKE -Raw
+          $content = Get-Content $env:CMAKE_PATH -Raw
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
           $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $env:DEF_PATH`$3"
           $content += "`ntarget_link_options(tdjson PRIVATE "/DEF:$env:DEF_PATH")`n"
-          $content | Set-Content $env:MAIN_CMAKE -Force
+          $content | Set-Content $env:CMAKE_PATH -Force
+          Write-Host "修改CMakeLists.txt：$env:CMAKE_PATH"
 
       - name: 7. 安装依赖
         run: |
@@ -78,13 +95,16 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --clean-after-build
 
-      - name: 8. 配置编译（直接指向仓库根目录）
+      - name: 8. 配置编译（基于找到的CMake路径）
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
+          # CMakeLists.txt所在目录作为源码目录
+          $cmakeDir = Split-Path $env:CMAKE_PATH -Parent
           cmake -G "Visual Studio 17 2022" -A Win32 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
-            -DCMAKE_BUILD_TYPE=Release ..  # 源码目录是仓库根目录（..指向根目录）
+            -DCMAKE_BUILD_TYPE=Release `
+            $cmakeDir  # 直接指向CMake所在目录
 
       - name: 9. 编译tdjson.dll
         run: |
@@ -94,5 +114,5 @@ jobs:
       - name: 10. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: 最终可用DLL
+          name: 最终DLL
           path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
