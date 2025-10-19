@@ -1,4 +1,4 @@
-name: 修复LNK2001错误 - 最终可用版
+name: 终极修复LNK2001 - 强制导出函数
 
 on:
   workflow_dispatch:
@@ -9,10 +9,10 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
+      # 核心文件路径（你的仓库实际位置）
       MAIN_CMAKE: ./CMakeLists.txt
-      # 核心源码文件（必须编译的实现文件）
-      CORE_SRC_FILE: ./td/telegram/td_json_client.cpp
-      CORE_SRC_DIR: ./td/telegram
+      CORE_SRC: ./td/telegram/td_json_client.cpp  # 函数实现文件
+      DEF_PATH: ./td/telegram/tdjson.def          # .def文件
 
     steps:
       - name: 1. 检出仓库
@@ -28,10 +28,22 @@ jobs:
           git submodule update --init --force td/
           git -C td/ submodule update --init --recursive --force
 
-      - name: 3. 生成.def文件（确保函数名匹配）
+      - name: 3. 直接修改源码（强制添加导出标记）
         run: |
-          $absCoreDir = (Resolve-Path $env:CORE_SRC_DIR).Path -replace '\\', '/'
-          $defPath = "$absCoreDir/tdjson.def"
+          # 编辑td_json_client.cpp，给每个函数添加导出和调用约定
+          $content = Get-Content $env:CORE_SRC -Raw
+          # 替换函数声明，确保导出并使用stdcall
+          $content = $content -replace 'td_json_client_create\(\)', '__declspec(dllexport) void* __stdcall td_json_client_create()'
+          $content = $content -replace 'td_json_client_destroy\(void \*client\)', '__declspec(dllexport) void __stdcall td_json_client_destroy(void *client)'
+          $content = $content -replace 'td_json_client_send\(void \*client, const char \*request\)', '__declspec(dllexport) void __stdcall td_json_client_send(void *client, const char *request)'
+          $content = $content -replace 'td_json_client_receive\(void \*client, double timeout\)', '__declspec(dllexport) const char* __stdcall td_json_client_receive(void *client, double timeout)'
+          $content = $content -replace 'td_json_client_execute\(void \*client, const char \*request\)', '__declspec(dllexport) const char* __stdcall td_json_client_execute(void *client, const char *request)'
+          $content | Set-Content $env:CORE_SRC -Force
+          Write-Host "✅ 已在源码中添加导出标记和stdcall"
+
+      - name: 4. 生成匹配的.def文件
+        run: |
+          $absDefPath = (Resolve-Path $env:DEF_PATH).Path -replace '\\', '/'
           @"
           LIBRARY tdjson.dll
           EXPORTS
@@ -40,28 +52,23 @@ jobs:
               td_json_client_send@8
               td_json_client_receive@12
               td_json_client_execute@8
-          "@ | Set-Content $defPath -Force
-          echo "DEF_CMAKE_PATH=$defPath" >> $env:GITHUB_ENV
+          "@ | Set-Content $absDefPath -Force
+          echo "DEF_ABS_PATH=$absDefPath" >> $env:GITHUB_ENV
 
-      - name: 4. 修改CMakeLists.txt（关键：强制包含实现文件）
+      - name: 5. 修改CMakeLists.txt（强制关联实现文件）
         run: |
           $content = Get-Content $env:MAIN_CMAKE -Raw
-          # 1. 确保td_json_client.cpp被编译（核心修复）
-          $coreSrcAbs = (Resolve-Path $env:CORE_SRC_FILE).Path -replace '\\', '/'
-          # 2. 修复add_library，明确包含实现文件和.def
-          $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $coreSrcAbs`n    $env:DEF_CMAKE_PATH`$3"
-          # 3. 强制函数调用约定为stdcall（匹配易语言）
-          $content = $content -replace 'td_json_client_create', '__declspec(dllexport) void* __stdcall td_json_client_create'
-          $content = $content -replace 'td_json_client_destroy', '__declspec(dllexport) void __stdcall td_json_client_destroy'
-          $content = $content -replace 'td_json_client_send', '__declspec(dllexport) void __stdcall td_json_client_send'
-          $content = $content -replace 'td_json_client_receive', '__declspec(dllexport) const char* __stdcall td_json_client_receive'
-          $content = $content -replace 'td_json_client_execute', '__declspec(dllexport) const char* __stdcall td_json_client_execute'
-          # 4. 链接器选项
-          $content += "`ntarget_link_options(tdjson PRIVATE /DEF:`"$env:DEF_CMAKE_PATH`")`n"
+          # 1. 确保td_json_client.cpp被添加到tdjson目标
+          $coreAbs = (Resolve-Path $env:CORE_SRC).Path -replace '\\', '/'
+          $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $coreAbs`n    $env:DEF_ABS_PATH`$3"
+          # 2. 移除可能冲突的导出宏定义
+          $content = $content -replace 'add_definitions\(-DTD_JSON_CLIENT_API=.*?\)', ''
+          # 3. 链接器强制使用.def
+          $content += "`ntarget_link_options(tdjson PRIVATE /DEF:`"$env:DEF_ABS_PATH`")`n"
           $content | Set-Content $env:MAIN_CMAKE -Force
-          Write-Host "✅ 已强制包含实现文件和调用约定"
+          Write-Host "✅ 已强制关联实现文件和.def"
 
-      - name: 5. 安装依赖
+      - name: 6. 安装依赖
         run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
@@ -69,7 +76,7 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --clean-after-build
 
-      - name: 6. 配置编译
+      - name: 7. 配置编译
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
@@ -77,13 +84,13 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release ..
 
-      - name: 7. 编译tdjson.dll
+      - name: 8. 编译tdjson.dll
         run: |
           cd $env:BUILD_DIR
           cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
-      - name: 8. 上传产物
+      - name: 9. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: 最终可用DLL（修复LNK2001）
+          name: 最终成功DLL
           path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
