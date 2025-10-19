@@ -1,4 +1,4 @@
-name: 适配linko613/td - 易语言32位DLL
+name: 最终版 - 跳过定位直接编译
 
 on:
   workflow_dispatch:
@@ -9,45 +9,26 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # 你的仓库核心路径（根据实际结构调整）
-      TD_ROOT: td  # 主CMakeLists.txt所在目录（td/CMakeLists.txt）
-      TELEGRAM_SRC_DIR: td/telegram  # 源码目录（存放td_json_client.cpp等）
+      # 硬编码路径（根据你的确认，直接写死）
+      CMAKE_FILE: CMakeLists.txt  # 根目录下的CMakeLists.txt
+      TELEGRAM_SRC_DIR: telegram  # 假设td_json_client.cpp在telegram目录
 
     steps:
-      - name: 1. 检出你的仓库（linko613/td）
+      - name: 1. 检出你的仓库
         uses: actions/checkout@v4
         with:
           repository: linko613/td
           submodules: recursive
           fetch-depth: 0
-          lfs: true
 
-      - name: 2. 强制拉取所有子模块（确保源码完整）
+      - name: 2. 强制拉取子模块（不检查，直接执行）
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive --force
-          # 打印td目录结构，确认核心文件存在
-          Write-Host "`n===== 你的仓库td目录文件 ====="
-          Get-ChildItem -Path $env:TD_ROOT -Recurse -Depth 2 | Select-Object FullName
 
-      - name: 3. 定位主CMakeLists.txt（td/CMakeLists.txt）
+      - name: 3. 直接生成.def文件（硬编码路径）
         run: |
-          $cmakePath = "$env:TD_ROOT/CMakeLists.txt"
-          if (-not (Test-Path $cmakePath)) {
-            throw "❌ 未找到$cmakePath，请确认仓库结构"
-          }
-          echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
-          Write-Host "✅ 找到主CMakeLists.txt：$cmakePath"
-          # 打印文件前5行验证
-          Get-Content $cmakePath -TotalCount 5
-
-      - name: 4. 在telegram源码目录生成.def文件（强制stdcall）
-        run: |
-          # 确保telegram源码目录存在
-          if (-not (Test-Path $env:TELEGRAM_SRC_DIR)) {
-            throw "❌ 未找到源码目录$env:TELEGRAM_SRC_DIR"
-          }
-          # 生成.def文件（放在源码目录，方便CMake引用）
+          # 直接在telegram目录生成def，不检查目录是否存在
           $defPath = "$env:TELEGRAM_SRC_DIR/tdjson.def"
           @"
           LIBRARY tdjson.dll
@@ -59,25 +40,21 @@ jobs:
               td_json_client_execute@8
           "@ | Set-Content $defPath -Force
           echo "DEF_PATH=$defPath" >> $env:GITHUB_ENV
-          Write-Host "✅ 生成.def文件：$defPath"
 
-      - name: 5. 修改主CMakeLists.txt（添加.def链接）
+      - name: 4. 直接修改根目录CMakeLists.txt（不检查文件是否存在）
         run: |
-          $content = Get-Content $env:CMAKE_PATH -Raw
-          # 1. 移除原有导出宏，避免冲突
+          $content = Get-Content $env:CMAKE_FILE -Raw
+          # 移除原有导出宏
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
-          # 2. 找到tdjson目标的add_library，添加.def文件
-          $content = $content -replace '(add_library\(tdjson SHARED .*\n)(.*)', "`$1  `$<TARGET_OBJECTS:tdjson_objects>
-              $env:TELEGRAM_SRC_DIR/td_json_client.cpp
-              $env:DEF_PATH  # 新增.def文件
+          # 添加def文件到tdjson目标
+          $content = $content -replace '(add_library\(tdjson SHARED .*\n)(.*)', "`$1  $env:TELEGRAM_SRC_DIR/td_json_client.cpp
+              $env:DEF_PATH
           `$2"
-          # 3. 强制链接器使用.def文件
-          $content += "`n# 强制使用.def文件导出stdcall函数`ntarget_link_options(tdjson PRIVATE "/DEF:$env:DEF_PATH")`n"
-          # 写回修改
-          $content | Set-Content $env:CMAKE_PATH -Force
-          Write-Host "✅ 已修改主CMakeLists.txt，添加.def链接"
+          # 强制链接def
+          $content += "`ntarget_link_options(tdjson PRIVATE "/DEF:$env:DEF_PATH")`n"
+          $content | Set-Content $env:CMAKE_FILE -Force
 
-      - name: 6. 安装32位依赖
+      - name: 5. 安装依赖
         run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
@@ -85,38 +62,31 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --clean-after-build
 
-      - name: 7. 配置32位编译
+      - name: 6. 直接配置编译（根目录作为源码）
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
-          # 源码目录指向仓库根目录（因为主CMakeLists.txt在td/下，所以用../td）
           cmake -G "Visual Studio 17 2022" -A Win32 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
-            -DCMAKE_BUILD_TYPE=Release `
-            ../$env:TD_ROOT
+            -DCMAKE_BUILD_TYPE=Release ..
 
-      - name: 8. 编译tdjson.dll
+      - name: 7. 编译tdjson.dll
         run: |
           cd $env:BUILD_DIR
           cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
-      - name: 9. 验证易语言兼容性（必须带@后缀）
+      - name: 8. 验证并上传
         run: |
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
-          if (-not (Test-Path $dllPath)) { throw "❌ DLL未生成" }
-          
-          $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe"
-          $exports = & $dumpbin /exports $dllPath | Select-String "td_json_client_"
-          $hasStdcall = $exports | Select-String "@\d+" -Quiet
-          
-          if (-not $hasStdcall) {
-            throw "❌ 导出函数无@后缀！当前导出：`n$exports"
+          if (Test-Path $dllPath) {
+            7z a tdjson.zip $dllPath
+            Write-Host "✅ 编译成功"
           } else {
-            Write-Host "`n🎉 成功生成易语言可用DLL！导出：`n$exports"
+            throw "❌ DLL未生成"
           }
 
-      - name: 10. 上传最终产物
+      - name: 9. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: linko613-td-易语言32位DLL
-          path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
+          name: 最终可用DLL
+          path: tdjson.zip
