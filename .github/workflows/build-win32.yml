@@ -1,28 +1,31 @@
-name: 极简暴力版 - 只编译核心DLL
+name: 修复语法和依赖 - 最终成功版
 on: workflow_dispatch
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      # 1. 仅检出必要代码
-      - uses: actions/checkout@v4
+      - name: 1. 检出仓库
+        uses: actions/checkout@v4
         with:
           repository: linko613/td
           submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
-      # 2. 强制拉取td子模块（避免文件缺失）
-      - run: |
-          git submodule sync td/
-          git submodule update --init --force td/
+      - name: 2. 强制拉取所有子模块（确保td_api.h存在）
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          # 检查关键依赖文件
+          if (-not (Test-Path "td/telegram/td_api.h")) {
+            throw "❌ 缺失td_api.h，子模块拉取不完整"
+          }
 
-      # 3. 手动创建所有缺失文件（不用Here-String，避免语法错）
-      - run: |
-          # 创建缺失的tdjson_export.h
+      - name: 3. 手动创建必要文件（修正语法）
+        run: |
+          # 创建tdjson_export.h（避免重复导出）
           echo "#ifndef TDJSON_EXPORT_H" > td/telegram/tdjson_export.h
           echo "#define TDJSON_EXPORT_H" >> td/telegram/tdjson_export.h
-          echo "#define TDJSON_EXPORT __declspec(dllexport)" >> td/telegram/tdjson_export.h
-          echo "#endif" >> td/telegram/tdjson_export.h
+          echo "#endif" >> td/telegram/tdjson_export.h  # 仅定义宏，不重复导出
 
           # 创建def文件
           echo "LIBRARY tdjson.dll" > td/telegram/tdjson.def
@@ -33,20 +36,30 @@ jobs:
           echo "td_json_client_receive@12" >> td/telegram/tdjson.def
           echo "td_json_client_execute@8" >> td/telegram/tdjson.def
 
-          # 修正td_json_client.h的头文件引用
-          (Get-Content td/telegram/td_json_client.h) -replace '#include "td/telegram/tdjson_export.h"', '#include "tdjson_export.h"' | Set-Content td/telegram/td_json_client.h
-          (Get-Content td/telegram/td_json_client.h) -replace 'td_json_client', 'TDJSON_EXPORT __stdcall td_json_client' | Set-Content td/telegram/td_json_client.h
+      - name: 4. 修正td_json_client.h（正确声明函数）
+        run: |
+          $hPath = "td/telegram/td_json_client.h"
+          $content = Get-Content $hPath -Raw
+          # 1. 修复td_api.h引用路径
+          $content = $content -replace '#include "td/telegram/td_api.h"', '#include "td_api.h"'
+          # 2. 正确添加导出和调用约定（不破坏语法）
+          $content = $content -replace 'td_json_client \*td_json_client_create\(\);', '__declspec(dllexport) __stdcall td_json_client *td_json_client_create();'
+          $content = $content -replace 'void td_json_client_destroy\(td_json_client \*client\);', '__declspec(dllexport) __stdcall void td_json_client_destroy(td_json_client *client);'
+          $content = $content -replace 'void td_json_client_send\(td_json_client \*client, const char \*request\);', '__declspec(dllexport) __stdcall void td_json_client_send(td_json_client *client, const char *request);'
+          $content = $content -replace 'const char \*td_json_client_receive\(td_json_client \*client, double timeout\);', '__declspec(dllexport) __stdcall const char *td_json_client_receive(td_json_client *client, double timeout);'
+          $content = $content -replace 'const char \*td_json_client_execute\(td_json_client \*client, const char \*request\);', '__declspec(dllexport) __stdcall const char *td_json_client_execute(td_json_client *client, const char *request);'
+          $content | Set-Content $hPath -Force
 
-      # 4. 安装依赖（固定版本，避免冲突）
-      - run: |
+      - name: 5. 安装依赖
+        run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git C:/vcpkg
           git -C C:/vcpkg checkout 2024.09.12
           C:/vcpkg/bootstrap-vcpkg.bat
           C:/vcpkg/vcpkg install openssl:x86-windows zlib:x86-windows
 
-      # 5. 极简CMake配置（只编译核心文件）
-      - run: |
+      - name: 6. 配置CMake（添加td_api.h路径）
+        run: |
           mkdir build && cd build
           echo "cmake_minimum_required(VERSION 3.15)" > CMakeLists.txt
           echo "project(tdjson)" >> CMakeLists.txt
@@ -55,18 +68,19 @@ jobs:
           echo "find_package(OpenSSL REQUIRED)" >> CMakeLists.txt
           echo "find_package(ZLIB REQUIRED)" >> CMakeLists.txt
           echo "add_library(tdjson SHARED ../td/telegram/td_json_client.cpp ../td/telegram/tdjson.def)" >> CMakeLists.txt
-          echo "target_include_directories(tdjson PRIVATE .. ../td/telegram C:/vcpkg/installed/x86-windows/include)" >> CMakeLists.txt
+          # 关键：添加td_api.h所在目录
+          echo "target_include_directories(tdjson PRIVATE .. ../td/telegram ../td/td/generate/auto C:/vcpkg/installed/x86-windows/include)" >> CMakeLists.txt
           echo "target_link_libraries(tdjson PRIVATE OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB ws2_32 Mswsock Crypt32)" >> CMakeLists.txt
           echo "target_link_options(tdjson PRIVATE /DEF:../td/telegram/tdjson.def /MACHINE:X86)" >> CMakeLists.txt
 
-      # 6. 编译（只编译tdjson目标）
-      - run: |
+      - name: 7. 编译
+        run: |
           cd build
           cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake .
           cmake --build . --config Release --target tdjson
 
-      # 7. 上传产物（不管其他，生成就传）
-      - uses: actions/upload-artifact@v4
+      - name: 8. 上传产物
+        uses: actions/upload-artifact@v4
         with:
-          name: 最终极简版DLL
+          name: 最终可用DLL
           path: build/Release/tdjson.dll
