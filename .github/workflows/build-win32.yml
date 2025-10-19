@@ -1,4 +1,4 @@
-name: 易语言32位DLL（手动克隆td子模块）
+name: 易语言32位DLL（无git纯源码包版）
 
 on:
   workflow_dispatch:
@@ -9,47 +9,37 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # TDLib官方仓库地址（直接克隆，绕开子模块问题）
-      TD_REPO: https://github.com/tdlib/td.git
-      TD_DIR: td  # 目标目录：根目录下的td文件夹
+      # 直接用TDLib官方发布的源码包（v1.8.55，和你目录版本一致）
+      TD_VERSION: 1.8.55
+      TD_ZIP_URL: https://github.com/tdlib/td/archive/refs/tags/v1.8.55.zip
+      TD_DIR: td-${{ env.TD_VERSION }}  # 解压后的目录名
 
     steps:
-      - name: 检出主项目源码
-        uses: actions/checkout@v4
-        with:
-          # 只拉取主项目，暂时忽略子模块（因为子模块拉取失败）
-          submodules: false
-          fetch-depth: 1
-
-      - name: 手动删除旧td目录（如果存在）
+      - name: 下载TDLib官方源码包（无git，无submodule）
         run: |
-          if (Test-Path $env:TD_DIR) {
-            Remove-Item -Recurse -Force $env:TD_DIR
-            Write-Host "已删除旧的$env:TD_DIR目录"
-          }
+          # 直接下载zip包，绕开所有git子模块问题
+          Invoke-WebRequest -Uri $env:TD_ZIP_URL -OutFile td.zip
+          # 解压到当前目录
+          Expand-Archive -Path td.zip -DestinationPath . -Force
+          # 验证解压后的目录结构
+          Write-Host "`n===== 解压后的TDLib目录 ====="
+          Get-ChildItem -Path $env:TD_DIR -Recurse -Depth 2 | Select-Object FullName
 
-      - name: 手动克隆td子模块（关键步骤）
+      - name: 确认telegram/CMakeLists.txt必然存在
         run: |
-          Write-Host "开始手动克隆td子模块到$env:TD_DIR..."
-          git clone $env:TD_REPO $env:TD_DIR
-          # 切换到最新稳定版（避免开发分支问题）
-          git -C $env:TD_DIR checkout v1.8.55
-          # 拉取td自身的子模块（telegram模块在这里面）
-          git -C $env:TD_DIR submodule update --init --recursive --force
-          Write-Host "`n===== 克隆后td/telegram目录结构 ====="
-          Get-ChildItem -Path "$env:TD_DIR/telegram" -Recurse -Depth 1 | Select-Object FullName
-
-      - name: 确认telegram/CMakeLists.txt存在
-        run: |
-          $cmakePath = "$env:TD_DIR/telegram/CMakeLists.txt"
+          $cmakePath = "$env:TD_DIR/td/telegram/CMakeLists.txt"  # 官方包的固定路径
           if (-not (Test-Path $cmakePath)) {
-            throw "❌ 手动克隆后仍未找到$cmakePath！可能TDLib仓库结构变更，请检查官方仓库"
+            throw "❌ 官方源码包中未找到$cmakePath！请检查版本是否正确"
           }
+          # 输出该文件内容，证明存在
+          Write-Host "`n===== 找到CMakeLists.txt内容（前5行） ====="
+          Get-Content $cmakePath -TotalCount 5
+          # 保存路径
           echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
-          echo "TELEGRAM_DIR=$env:TD_DIR/telegram" >> $env:GITHUB_ENV
-          Write-Host "✅ 确认存在：$cmakePath"
+          echo "TELEGRAM_DIR=$env:TD_DIR/td/telegram" >> $env:GITHUB_ENV
+          Write-Host "✅ 官方源码包中确认存在：$cmakePath"
 
-      - name: 生成.def文件（易语言适配）
+      - name: 生成易语言专用.def文件
         run: |
           $defPath = "$env:TELEGRAM_DIR\tdjson.def"
           @"
@@ -63,10 +53,12 @@ jobs:
           "@ | Set-Content $defPath -Force
           Write-Host "生成.def文件：$defPath"
 
-      - name: 修改td/telegram/CMakeLists.txt
+      - name: 修改官方CMakeLists.txt（强制导出）
         run: |
           $content = Get-Content $env:CMAKE_PATH -Raw
+          # 移除原有导出宏，仅用.def文件
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
+          # 强制添加.def文件到编译
           $content = $content -replace 'add_library\(tdjson SHARED .*\)', @"
           add_library(tdjson SHARED
               `$<TARGET_OBJECTS:tdjson_objects>
@@ -77,7 +69,7 @@ jobs:
           "@
           $content | Set-Content $env:CMAKE_PATH -Force
 
-      - name: 安装依赖
+      - name: 安装vcpkg及32位依赖
         run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
@@ -85,28 +77,36 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --no-print-usage
 
-      - name: 配置编译
+      - name: 配置32位编译
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
-          cmake -G "Visual Studio 17 2022" -A Win32 -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" -DCMAKE_BUILD_TYPE=Release ..
+          # 源码目录指向解压后的TDLib根目录
+          cmake -G "Visual Studio 17 2022" -A Win32 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            ../$env:TD_DIR
 
-      - name: 编译DLL
+      - name: 编译tdjson.dll（仅核心目标）
         run: |
           cd $env:BUILD_DIR
           cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
-      - name: 验证并上传
+      - name: 验证易语言兼容性（必须带@后缀）
         run: |
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
-          if (Test-Path $dllPath) {
-            Write-Host "✅ 编译成功：$dllPath"
+          if (-not (Test-Path $dllPath)) { throw "DLL未生成" }
+          
+          $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe"
+          $exports = & $dumpbin /exports $dllPath | Select-String "td_json_client_"
+          if (-not ($exports | Select-String "@\d+")) {
+            throw "❌ 导出函数无@后缀！易语言无法调用"
           } else {
-            throw "❌ DLL未生成"
+            Write-Host "✅ 成功生成易语言可用DLL！导出：`n$exports"
           }
 
-      - name: 上传产物
+      - name: 上传最终可用产物
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-easy-ultimate
-          path: ${{ env.BUILD_DIR }}/Release/*.dll
+          name: tdjson-easy-final-success
+          path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
