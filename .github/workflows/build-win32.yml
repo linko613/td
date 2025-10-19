@@ -1,4 +1,4 @@
-name: 修复CMake转义错误 - 最终成功版
+name: 修复LNK2001错误 - 最终可用版
 
 on:
   workflow_dispatch:
@@ -10,6 +10,8 @@ jobs:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
       MAIN_CMAKE: ./CMakeLists.txt
+      # 核心源码文件（必须编译的实现文件）
+      CORE_SRC_FILE: ./td/telegram/td_json_client.cpp
       CORE_SRC_DIR: ./td/telegram
 
     steps:
@@ -20,17 +22,16 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: 2. 强制拉取td子模块
+      - name: 2. 强制拉取子模块
         run: |
           git submodule sync td/
           git submodule update --init --force td/
           git -C td/ submodule update --init --recursive --force
 
-      - name: 3. 生成.def文件（CMake兼容的正斜杠路径）
+      - name: 3. 生成.def文件（确保函数名匹配）
         run: |
-          # 关键：将绝对路径转换为CMake支持的正斜杠格式
           $absCoreDir = (Resolve-Path $env:CORE_SRC_DIR).Path -replace '\\', '/'
-          $defPath = "$absCoreDir/tdjson.def"  # 正斜杠分隔
+          $defPath = "$absCoreDir/tdjson.def"
           @"
           LIBRARY tdjson.dll
           EXPORTS
@@ -40,21 +41,25 @@ jobs:
               td_json_client_receive@12
               td_json_client_execute@8
           "@ | Set-Content $defPath -Force
-          if (-not (Test-Path $defPath)) { throw "❌ 未生成$defPath" }
-          Write-Host "✅ 生成.def文件（CMake兼容路径）：$defPath"
-          echo "DEF_CMAKE_PATH=$defPath" >> $env:GITHUB_ENV  # 保存正斜杠路径
+          echo "DEF_CMAKE_PATH=$defPath" >> $env:GITHUB_ENV
 
-      - name: 4. 修改CMakeLists.txt（修复路径转义）
+      - name: 4. 修改CMakeLists.txt（关键：强制包含实现文件）
         run: |
           $content = Get-Content $env:MAIN_CMAKE -Raw
-          # 移除导出宏
-          $content = $content -replace 'TD_JSON_CLIENT_API', ''
-          # 用正斜杠路径添加.def文件，避免CMake转义错误
-          $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $env:DEF_CMAKE_PATH`$3"
-          # 链接器选项也用正斜杠路径
-          $content += "`n# 修复CMake路径转义：使用正斜杠`ntarget_link_options(tdjson PRIVATE /DEF:`"$env:DEF_CMAKE_PATH`")`n"
+          # 1. 确保td_json_client.cpp被编译（核心修复）
+          $coreSrcAbs = (Resolve-Path $env:CORE_SRC_FILE).Path -replace '\\', '/'
+          # 2. 修复add_library，明确包含实现文件和.def
+          $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $coreSrcAbs`n    $env:DEF_CMAKE_PATH`$3"
+          # 3. 强制函数调用约定为stdcall（匹配易语言）
+          $content = $content -replace 'td_json_client_create', '__declspec(dllexport) void* __stdcall td_json_client_create'
+          $content = $content -replace 'td_json_client_destroy', '__declspec(dllexport) void __stdcall td_json_client_destroy'
+          $content = $content -replace 'td_json_client_send', '__declspec(dllexport) void __stdcall td_json_client_send'
+          $content = $content -replace 'td_json_client_receive', '__declspec(dllexport) const char* __stdcall td_json_client_receive'
+          $content = $content -replace 'td_json_client_execute', '__declspec(dllexport) const char* __stdcall td_json_client_execute'
+          # 4. 链接器选项
+          $content += "`ntarget_link_options(tdjson PRIVATE /DEF:`"$env:DEF_CMAKE_PATH`")`n"
           $content | Set-Content $env:MAIN_CMAKE -Force
-          Write-Host "✅ 已修复CMake路径转义，使用路径：$env:DEF_CMAKE_PATH"
+          Write-Host "✅ 已强制包含实现文件和调用约定"
 
       - name: 5. 安装依赖
         run: |
@@ -80,5 +85,5 @@ jobs:
       - name: 8. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: 最终成功DLL
+          name: 最终可用DLL（修复LNK2001）
           path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
