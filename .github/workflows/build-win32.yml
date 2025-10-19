@@ -1,4 +1,4 @@
-name: 易语言32位DLL（精准定位td/telegram）
+name: 易语言32位DLL（手动克隆td子模块）
 
 on:
   workflow_dispatch:
@@ -9,43 +9,45 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # 明确指定已知路径（根据你的目录结构，telegram在td文件夹下）
-      TARGET_PATH: "td/telegram"
+      # TDLib官方仓库地址（直接克隆，绕开子模块问题）
+      TD_REPO: https://github.com/tdlib/td.git
+      TD_DIR: td  # 目标目录：根目录下的td文件夹
 
     steps:
-      - name: 检出源码（强制拉取td子模块）
+      - name: 检出主项目源码
         uses: actions/checkout@v4
         with:
-          repository: tdlib/td  # 你的仓库地址
-          submodules: recursive
-          fetch-depth: 0
-          lfs: true
+          # 只拉取主项目，暂时忽略子模块（因为子模块拉取失败）
+          submodules: false
+          fetch-depth: 1
 
-      - name: 强制拉取td子模块（关键修复）
+      - name: 手动删除旧td目录（如果存在）
         run: |
-          # 单独针对td文件夹的子模块进行强制更新（最可能藏着telegram）
-          git submodule update --init --force td/
-          git submodule update --init --force td/telegram/  # 直接指定telegram路径
-          Write-Host "`n===== td文件夹下的结构 ====="
-          Get-ChildItem -Path ./td -Recurse -Depth 2 | Select-Object FullName  # 输出td下的文件
-
-      - name: 精准查找telegram/CMakeLists.txt
-        run: |
-          $targetCmake = "$env:TARGET_PATH/CMakeLists.txt"
-          Write-Host "`n===== 检查目标路径：$targetCmake ====="
-          
-          if (Test-Path $targetCmake) {
-            $cmakePath = (Resolve-Path $targetCmake).Path
-            $telegramDir = Split-Path $cmakePath -Parent
-            echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
-            echo "TELEGRAM_DIR=$telegramDir" >> $env:GITHUB_ENV
-            Write-Host "✅ 找到目标文件：$cmakePath"
-          } else {
-            # 输出td/telegram下的实际文件，帮你确认缺失原因
-            Write-Host "`n===== td/telegram下的实际文件 ====="
-            Get-ChildItem -Path ./td/telegram -ErrorAction SilentlyContinue | Select-Object Name
-            throw "❌ 仍未找到$targetCmake！请查看上面的文件列表，确认该文件是否存在（可能子模块未拉取完整）"
+          if (Test-Path $env:TD_DIR) {
+            Remove-Item -Recurse -Force $env:TD_DIR
+            Write-Host "已删除旧的$env:TD_DIR目录"
           }
+
+      - name: 手动克隆td子模块（关键步骤）
+        run: |
+          Write-Host "开始手动克隆td子模块到$env:TD_DIR..."
+          git clone $env:TD_REPO $env:TD_DIR
+          # 切换到最新稳定版（避免开发分支问题）
+          git -C $env:TD_DIR checkout v1.8.55
+          # 拉取td自身的子模块（telegram模块在这里面）
+          git -C $env:TD_DIR submodule update --init --recursive --force
+          Write-Host "`n===== 克隆后td/telegram目录结构 ====="
+          Get-ChildItem -Path "$env:TD_DIR/telegram" -Recurse -Depth 1 | Select-Object FullName
+
+      - name: 确认telegram/CMakeLists.txt存在
+        run: |
+          $cmakePath = "$env:TD_DIR/telegram/CMakeLists.txt"
+          if (-not (Test-Path $cmakePath)) {
+            throw "❌ 手动克隆后仍未找到$cmakePath！可能TDLib仓库结构变更，请检查官方仓库"
+          }
+          echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
+          echo "TELEGRAM_DIR=$env:TD_DIR/telegram" >> $env:GITHUB_ENV
+          Write-Host "✅ 确认存在：$cmakePath"
 
       - name: 生成.def文件（易语言适配）
         run: |
@@ -59,6 +61,7 @@ jobs:
               td_json_client_receive@12
               td_json_client_execute@8
           "@ | Set-Content $defPath -Force
+          Write-Host "生成.def文件：$defPath"
 
       - name: 修改td/telegram/CMakeLists.txt
         run: |
@@ -93,8 +96,17 @@ jobs:
           cd $env:BUILD_DIR
           cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
+      - name: 验证并上传
+        run: |
+          $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
+          if (Test-Path $dllPath) {
+            Write-Host "✅ 编译成功：$dllPath"
+          } else {
+            throw "❌ DLL未生成"
+          }
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-easy-success
+          name: tdjson-easy-ultimate
           path: ${{ env.BUILD_DIR }}/Release/*.dll
