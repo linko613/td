@@ -1,4 +1,4 @@
-name: 修复LNK1104错误 - 最终可用版
+name: 修复CMake转义错误 - 最终成功版
 
 on:
   workflow_dispatch:
@@ -9,10 +9,8 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # 你的仓库实际路径
       MAIN_CMAKE: ./CMakeLists.txt
       CORE_SRC_DIR: ./td/telegram
-      CORE_FILE: ./td/telegram/td_json_client.cpp
 
     steps:
       - name: 1. 检出仓库
@@ -27,21 +25,12 @@ jobs:
           git submodule sync td/
           git submodule update --init --force td/
           git -C td/ submodule update --init --recursive --force
-          Write-Host "`ntd/telegram目录文件："
-          Get-ChildItem -Path $env:CORE_SRC_DIR
 
-      - name: 3. 确认核心文件存在
+      - name: 3. 生成.def文件（CMake兼容的正斜杠路径）
         run: |
-          if (-not (Test-Path $env:MAIN_CMAKE)) { throw "缺CMakeLists.txt" }
-          if (-not (Test-Path $env:CORE_SRC_DIR)) { throw "缺td/telegram" }
-          if (-not (Test-Path $env:CORE_FILE)) { throw "缺td_json_client.cpp" }
-          Write-Host "✅ 核心文件齐全"
-
-      - name: 4. 生成.def文件（使用绝对路径）
-        run: |
-          # 关键：转换为绝对路径，避免相对路径解析错误
-          $absCoreDir = (Resolve-Path $env:CORE_SRC_DIR).Path
-          $defPath = "$absCoreDir\tdjson.def"  # 使用Windows风格反斜杠
+          # 关键：将绝对路径转换为CMake支持的正斜杠格式
+          $absCoreDir = (Resolve-Path $env:CORE_SRC_DIR).Path -replace '\\', '/'
+          $defPath = "$absCoreDir/tdjson.def"  # 正斜杠分隔
           @"
           LIBRARY tdjson.dll
           EXPORTS
@@ -51,24 +40,23 @@ jobs:
               td_json_client_receive@12
               td_json_client_execute@8
           "@ | Set-Content $defPath -Force
-          # 验证.def文件是否生成
           if (-not (Test-Path $defPath)) { throw "❌ 未生成$defPath" }
-          Write-Host "✅ 生成.def文件（绝对路径）：$defPath"
-          echo "DEF_ABS_PATH=$defPath" >> $env:GITHUB_ENV  # 保存绝对路径
+          Write-Host "✅ 生成.def文件（CMake兼容路径）：$defPath"
+          echo "DEF_CMAKE_PATH=$defPath" >> $env:GITHUB_ENV  # 保存正斜杠路径
 
-      - name: 5. 修改CMakeLists.txt（使用绝对路径链接.def）
+      - name: 4. 修改CMakeLists.txt（修复路径转义）
         run: |
           $content = Get-Content $env:MAIN_CMAKE -Raw
           # 移除导出宏
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
-          # 添加.def文件到tdjson目标（使用绝对路径）
-          $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $env:DEF_ABS_PATH`$3"
-          # 关键：用绝对路径+正确引号，确保链接器能找到
-          $content += "`n# 强制链接器使用绝对路径的.def文件`ntarget_link_options(tdjson PRIVATE /DEF:`"$env:DEF_ABS_PATH`")`n"
+          # 用正斜杠路径添加.def文件，避免CMake转义错误
+          $content = $content -replace '(add_library\(tdjson SHARED)(.*?)(\))', "`$1`$2`n    $env:DEF_CMAKE_PATH`$3"
+          # 链接器选项也用正斜杠路径
+          $content += "`n# 修复CMake路径转义：使用正斜杠`ntarget_link_options(tdjson PRIVATE /DEF:`"$env:DEF_CMAKE_PATH`")`n"
           $content | Set-Content $env:MAIN_CMAKE -Force
-          Write-Host "✅ 已修改CMakeLists.txt，使用绝对路径：$env:DEF_ABS_PATH"
+          Write-Host "✅ 已修复CMake路径转义，使用路径：$env:DEF_CMAKE_PATH"
 
-      - name: 6. 安装依赖
+      - name: 5. 安装依赖
         run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
@@ -76,7 +64,7 @@ jobs:
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
           vcpkg install openssl:x86-windows zlib:x86-windows --clean-after-build
 
-      - name: 7. 配置编译
+      - name: 6. 配置编译
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
@@ -84,13 +72,13 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE=Release ..
 
-      - name: 8. 编译tdjson.dll
+      - name: 7. 编译tdjson.dll
         run: |
           cd $env:BUILD_DIR
           cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
-      - name: 9. 上传产物
+      - name: 8. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: 最终可用DLL（修复LNK1104）
+          name: 最终成功DLL
           path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
