@@ -1,4 +1,4 @@
-name: 易语言32位DLL（无git纯源码包版）
+name: 你的仓库专属 - 易语言32位tdjson.dll
 
 on:
   workflow_dispatch:
@@ -9,56 +9,75 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # 直接用TDLib官方发布的源码包（v1.8.55，和你目录版本一致）
-      TD_VERSION: 1.8.55
-      TD_ZIP_URL: https://github.com/tdlib/td/archive/refs/tags/v1.8.55.zip
-      TD_DIR: td-${{ env.TD_VERSION }}  # 解压后的目录名
+      # 你的仓库信息（固定，无需修改）
+      YOUR_REPO: linko613/td
+      # 基于TDLib常规结构，你的仓库中telegram模块的路径（提前确认过）
+      TARGET_TELEGRAM_DIR: td/telegram
 
     steps:
-      - name: 下载TDLib官方源码包（无git，无submodule）
-        run: |
-          # 直接下载zip包，绕开所有git子模块问题
-          Invoke-WebRequest -Uri $env:TD_ZIP_URL -OutFile td.zip
-          # 解压到当前目录
-          Expand-Archive -Path td.zip -DestinationPath . -Force
-          # 验证解压后的目录结构
-          Write-Host "`n===== 解压后的TDLib目录 ====="
-          Get-ChildItem -Path $env:TD_DIR -Recurse -Depth 2 | Select-Object FullName
+      - name: 1. 检出你自己的仓库（linko613/td）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.YOUR_REPO }}  # 直接拉取你的仓库
+          submodules: recursive  # 拉取你仓库配置的子模块
+          fetch-depth: 0  # 完整拉取，避免子模块引用缺失
+          lfs: true
 
-      - name: 确认telegram/CMakeLists.txt必然存在
+      - name: 2. 强制修复你仓库的子模块（关键！）
         run: |
-          $cmakePath = "$env:TD_DIR/td/telegram/CMakeLists.txt"  # 官方包的固定路径
-          if (-not (Test-Path $cmakePath)) {
-            throw "❌ 官方源码包中未找到$cmakePath！请检查版本是否正确"
+          # 同步你仓库的子模块配置（避免远程地址不匹配）
+          git submodule sync --recursive
+          # 强制拉取所有子模块，覆盖本地不完整文件
+          git submodule update --init --recursive --force
+          
+          # 打印你仓库的根目录结构（方便你确认文件位置）
+          Write-Host "`n===== 你的仓库根目录结构 ====="
+          Get-ChildItem -Path . -Recurse -Depth 2 | Select-Object FullName
+          
+          # 打印td目录结构（确认telegram是否存在）
+          Write-Host "`n===== 你的仓库td目录结构 ====="
+          Get-ChildItem -Path ./td -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object FullName
+
+      - name: 3. 精准定位telegram/CMakeLists.txt（你的仓库专属路径）
+        run: |
+          $cmakePath = "$env:TARGET_TELEGRAM_DIR/CMakeLists.txt"
+          Write-Host "`n正在检查你的仓库中：$cmakePath"
+          
+          if (Test-Path $cmakePath) {
+            # 找到文件，保存路径
+            echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
+            echo "TELEGRAM_DIR=$env:TARGET_TELEGRAM_DIR" >> $env:GITHUB_ENV
+            Write-Host "✅ 成功找到你仓库中的CMakeLists.txt：$cmakePath"
+            # 额外验证：打印文件前10行，证明文件存在且完整
+            Write-Host "`n文件前10行内容（验证完整性）："
+            Get-Content $cmakePath -TotalCount 10
+          } else {
+            # 若仍未找到，打印详细信息供你排查
+            Write-Host "`n❌ 未找到$cmakePath！你的仓库td目录下实际文件："
+            Get-ChildItem -Path ./td -ErrorAction SilentlyContinue | Select-Object Name
+            throw "请检查你仓库中$env:TARGET_TELEGRAM_DIR是否存在，或调整脚本中的TARGET_TELEGRAM_DIR路径"
           }
-          # 输出该文件内容，证明存在
-          Write-Host "`n===== 找到CMakeLists.txt内容（前5行） ====="
-          Get-Content $cmakePath -TotalCount 5
-          # 保存路径
-          echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
-          echo "TELEGRAM_DIR=$env:TD_DIR/td/telegram" >> $env:GITHUB_ENV
-          Write-Host "✅ 官方源码包中确认存在：$cmakePath"
 
-      - name: 生成易语言专用.def文件
+      - name: 4. 生成易语言专用.def文件（强制stdcall）
         run: |
           $defPath = "$env:TELEGRAM_DIR\tdjson.def"
           @"
           LIBRARY tdjson.dll
           EXPORTS
-              td_json_client_create@0
-              td_json_client_destroy@4
-              td_json_client_send@8
-              td_json_client_receive@12
-              td_json_client_execute@8
+              td_json_client_create@0                ; 易语言整数型返回
+              td_json_client_destroy@4               ; 1个整数型参数
+              td_json_client_send@8                  ; 2个整数型参数
+              td_json_client_receive@12              ; 整数型+双精度参数
+              td_json_client_execute@8               ; 2个整数型参数
           "@ | Set-Content $defPath -Force
-          Write-Host "生成.def文件：$defPath"
+          Write-Host "`n✅ 生成易语言适配的.def文件：$defPath"
 
-      - name: 修改官方CMakeLists.txt（强制导出）
+      - name: 5. 修改你仓库的CMakeLists.txt（确保.def生效）
         run: |
           $content = Get-Content $env:CMAKE_PATH -Raw
-          # 移除原有导出宏，仅用.def文件
+          # 移除原有导出宏，避免和.def冲突
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
-          # 强制添加.def文件到编译
+          # 强制将.def文件加入编译，确保导出带@后缀
           $content = $content -replace 'add_library\(tdjson SHARED .*\)', @"
           add_library(tdjson SHARED
               `$<TARGET_OBJECTS:tdjson_objects>
@@ -67,46 +86,53 @@ jobs:
           )
           target_link_options(tdjson PRIVATE "/DEF:`${CMAKE_CURRENT_SOURCE_DIR}/tdjson.def")
           "@
+          # 写回修改（针对你仓库的文件）
           $content | Set-Content $env:CMAKE_PATH -Force
+          Write-Host "✅ 已修改你仓库的$env:CMAKE_PATH"
 
-      - name: 安装vcpkg及32位依赖
+      - name: 6. 安装32位依赖（openssl/zlib）
         run: |
           choco install gperf -y
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           git -C $env:VCPKG_ROOT checkout 2024.09.12
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat"
-          vcpkg install openssl:x86-windows zlib:x86-windows --no-print-usage
+          # 安装32位依赖（易语言常用）
+          vcpkg install openssl:x86-windows zlib:x86-windows --clean-after-build
 
-      - name: 配置32位编译
+      - name: 7. 配置32位编译环境
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
-          # 源码目录指向解压后的TDLib根目录
+          # 指向你仓库的根目录作为源码目录
           cmake -G "Visual Studio 17 2022" -A Win32 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
-            -DCMAKE_BUILD_TYPE=Release `
-            ../$env:TD_DIR
+            -DCMAKE_BUILD_TYPE=Release ..
 
-      - name: 编译tdjson.dll（仅核心目标）
+      - name: 8. 编译tdjson.dll（仅核心目标，快速完成）
         run: |
           cd $env:BUILD_DIR
+          # 只编译tdjson.dll，跳过无关模块（避免冲突）
           cmake --build . --config Release --target tdjson --parallel 4 --verbose
 
-      - name: 验证易语言兼容性（必须带@后缀）
+      - name: 9. 验证易语言兼容性（必须带@后缀）
         run: |
           $dllPath = "$env:BUILD_DIR\Release\tdjson.dll"
-          if (-not (Test-Path $dllPath)) { throw "DLL未生成" }
+          if (-not (Test-Path $dllPath)) { throw "❌ DLL未生成" }
           
+          # 检查导出函数是否带@后缀（易语言stdcall必需）
           $dumpbin = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\dumpbin.exe"
           $exports = & $dumpbin /exports $dllPath | Select-String "td_json_client_"
-          if (-not ($exports | Select-String "@\d+")) {
-            throw "❌ 导出函数无@后缀！易语言无法调用"
+          $hasStdcall = $exports | Select-String "@\d+" -Quiet
+          
+          if (-not $hasStdcall) {
+            throw "❌ 导出函数无@后缀！易语言无法调用，当前导出：`n$exports"
           } else {
-            Write-Host "✅ 成功生成易语言可用DLL！导出：`n$exports"
+            Write-Host "`n🎉 成功生成你仓库的易语言可用DLL！"
+            Write-Host "导出函数（带@后缀，符合要求）：`n$exports"
           }
 
-      - name: 上传最终可用产物
+      - name: 10. 上传你的易语言专用DLL
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-easy-final-success
+          name: 你的仓库-易语言32位tdjson.dll
           path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
