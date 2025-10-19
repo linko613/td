@@ -1,4 +1,4 @@
-name: 补充缺失头文件 - 最终编译通过
+name: 修正语法错误 - 最终编译版
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ jobs:
       BUILD_DIR: build32
       CORE_SRC: td/telegram/td_json_client.cpp
       CORE_H: td/telegram/td_json_client.h
-      MISSING_H: td/telegram/tdjson_export.h  # 缺失的头文件
+      MISSING_H: td/telegram/tdjson_export.h
       DEF_FILE: tdjson.def
 
     steps:
@@ -22,106 +22,92 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: 2. 强制拉取所有子模块（确保依赖完整）
+      - name: 2. 强制拉取子模块
         run: |
-          # 深度拉取td子模块及其嵌套依赖（可能包含缺失的头文件）
           git submodule sync --recursive
           git submodule update --init --recursive --force
-          # 检查关键文件是否存在
-          Write-Host "`n===== 检查核心文件 ====="
           if (-not (Test-Path $env:CORE_SRC)) { throw "缺$env:CORE_SRC" }
           if (-not (Test-Path $env:CORE_H)) { throw "缺$env:CORE_H" }
-          # 提示缺失的头文件状态
-          if (-not (Test-Path $env:MISSING_H)) {
-            Write-Host "⚠️ 未找到$env:MISSING_H，将手动创建"
-          } else {
-            Write-Host "✅ 找到$env:MISSING_H"
-          }
 
-      - name: 3. 手动创建缺失的tdjson_export.h（绕过依赖）
+      - name: 3. 手动创建tdjson_export.h（修正语法）
         run: |
-          # 若原文件不存在，创建简化版本（仅定义必要宏）
           if (-not (Test-Path $env:MISSING_H)) {
+            # 关键：@"必须在行尾，"@必须在行首，无任何空格
             @"
-            #ifndef TDJSON_EXPORT_H
-            #define TDJSON_EXPORT_H
-            // 简化的导出宏，匹配之前的定义
-            #define TDJSON_EXPORT __declspec(dllexport)
-            #endif // TDJSON_EXPORT_H
-            "@ | Set-Content $env:MISSING_H -Force
-            Write-Host "✅ 已创建简化版$env:MISSING_H"
+#ifndef TDJSON_EXPORT_H
+#define TDJSON_EXPORT_H
+#define TDJSON_EXPORT __declspec(dllexport)
+#endif // TDJSON_EXPORT_H
+"@ | Set-Content $env:MISSING_H -Force
+            Write-Host "✅ 创建简化版$env:MISSING_H"
           }
 
-      - name: 4. 创建独立CMake配置（扩展头文件路径）
+      - name: 4. 创建独立CMake配置
         run: |
           mkdir -p $env:BUILD_DIR
           cd $env:BUILD_DIR
           @"
-          cmake_minimum_required(VERSION 3.15)
-          project(tdjson)
-          set(CMAKE_CXX_STANDARD 17)
-          set(CMAKE_BUILD_TYPE Release)
-          set(CMAKE_SYSTEM_PROCESSOR x86)
+cmake_minimum_required(VERSION 3.15)
+project(tdjson)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_SYSTEM_PROCESSOR x86)
 
-          find_package(OpenSSL REQUIRED)
-          find_package(ZLIB REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
-          add_library(tdjson SHARED
-              ../$env:CORE_SRC
-              ../$env:DEF_FILE
-          )
+add_library(tdjson SHARED
+    ../$env:CORE_SRC
+    ../$env:DEF_FILE
+)
 
-          # 扩展头文件搜索路径（包含td/telegram目录，确保能找到tdjson_export.h）
-          target_include_directories(tdjson PRIVATE
-              ..  # 仓库根目录
-              ../td/telegram  # 直接包含td/telegram目录（关键）
-              ../td/tdutils
-              ../td/td/generate/auto
-              $ENV{VCPKG_ROOT}/installed/x86-windows/include
-          )
+target_include_directories(tdjson PRIVATE
+    ..
+    ../td/telegram
+    ../td/tdutils
+    ../td/td/generate/auto
+    $ENV{VCPKG_ROOT}/installed/x86-windows/include
+)
 
-          target_link_libraries(tdjson PRIVATE
-              OpenSSL::SSL
-              OpenSSL::Crypto
-              ZLIB::ZLIB
-              ws2_32
-              Mswsock
-              Crypt32
-          )
+target_link_libraries(tdjson PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ZLIB::ZLIB
+    ws2_32
+    Mswsock
+    Crypt32
+)
 
-          target_compile_definitions(tdjson PRIVATE
-              _WINDLL
-              NOMINMAX
-              WIN32_LEAN_AND_MEAN
-          )
-          target_link_options(tdjson PRIVATE
-              /DEF:../$env:DEF_FILE
-              /MACHINE:X86
-          )
-          "@ | Set-Content CMakeLists.txt -Force
+target_compile_definitions(tdjson PRIVATE
+    _WINDLL
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+)
+target_link_options(tdjson PRIVATE
+    /DEF:../$env:DEF_FILE
+    /MACHINE:X86
+)
+"@ | Set-Content CMakeLists.txt -Force
 
       - name: 5. 生成.def文件
         run: |
           cd $env:BUILD_DIR
           @"
-          LIBRARY tdjson.dll
-          EXPORTS
-              td_json_client_create@0
-              td_json_client_destroy@4
-              td_json_client_send@8
-              td_json_client_receive@12
-              td_json_client_execute@8
-          "@ | Set-Content ../$env:DEF_FILE -Force
+LIBRARY tdjson.dll
+EXPORTS
+    td_json_client_create@0
+    td_json_client_destroy@4
+    td_json_client_send@8
+    td_json_client_receive@12
+    td_json_client_execute@8
+"@ | Set-Content ../$env:DEF_FILE -Force
 
-      - name: 6. 修正头文件依赖（避免嵌套错误）
+      - name: 6. 修正头文件引用
         run: |
           $hContent = Get-Content $env:CORE_H -Raw
-          # 确保tdjson_export.h的引用正确（如果原路径错误，修正为实际路径）
           $hContent = $hContent -replace '#include "td/telegram/tdjson_export.h"', '#include "tdjson_export.h"'
-          # 重新定义导出宏（与手动创建的tdjson_export.h匹配）
           $hContent = $hContent -replace 'TD_JSON_EXPORT', 'TDJSON_EXPORT __stdcall'
           $hContent | Set-Content $env:CORE_H -Force
-          Write-Host "✅ 已修正头文件引用"
 
       - name: 7. 安装依赖
         run: |
@@ -146,5 +132,5 @@ jobs:
       - name: 10. 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: 最终可用DLL
+          name: 语法修复后DLL
           path: ${{ env.BUILD_DIR }}/Release/tdjson.dll
