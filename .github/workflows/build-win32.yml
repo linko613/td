@@ -1,4 +1,4 @@
-name: 易语言32位DLL（手动路径容错版）
+name: 易语言32位DLL（精准定位td/telegram）
 
 on:
   workflow_dispatch:
@@ -9,65 +9,43 @@ jobs:
     env:
       VCPKG_ROOT: C:\vcpkg
       BUILD_DIR: build32
-      # 手动指定可能的telegram路径（根据你的项目结构修改）
-      MANUAL_TELEGRAM_PATHS: |
-        td/telegram
-        telegram
-        src/td/telegram
-        lib/td/telegram
+      # 明确指定已知路径（根据你的目录结构，telegram在td文件夹下）
+      TARGET_PATH: "td/telegram"
 
     steps:
-      - name: 检出源码（强制完整拉取）
+      - name: 检出源码（强制拉取td子模块）
         uses: actions/checkout@v4
         with:
-          repository: tdlib/td  # 替换为你的项目仓库地址
+          repository: tdlib/td  # 你的仓库地址
           submodules: recursive
-          fetch-depth: 0  # 拉取完整历史，避免子模块引用缺失
+          fetch-depth: 0
           lfs: true
 
-      - name: 强制修复子模块（关键步骤）
+      - name: 强制拉取td子模块（关键修复）
         run: |
-          # 同步子模块配置，解决远程地址变更问题
-          git submodule sync --recursive
-          # 强制更新子模块，覆盖本地不完整文件
-          git submodule update --init --recursive --force --depth 1
-          # 输出根目录结构，供确认文件位置
-          Write-Host "`n===== 根目录文件结构 ====="
-          Get-ChildItem -Path . -Recurse -Depth 3 | Select-Object FullName
+          # 单独针对td文件夹的子模块进行强制更新（最可能藏着telegram）
+          git submodule update --init --force td/
+          git submodule update --init --force td/telegram/  # 直接指定telegram路径
+          Write-Host "`n===== td文件夹下的结构 ====="
+          Get-ChildItem -Path ./td -Recurse -Depth 2 | Select-Object FullName  # 输出td下的文件
 
-      - name: 搜索telegram模块（自动+手动结合）
+      - name: 精准查找telegram/CMakeLists.txt
         run: |
-          # 1. 自动搜索
-          Write-Host "`n===== 自动搜索CMakeLists.txt ====="
-          $autoPaths = Get-ChildItem -Path . -Recurse -Filter "CMakeLists.txt" | Where-Object { $_.DirectoryName -match "telegram" } | Select-Object -ExpandProperty FullName
-          if ($autoPaths) {
-            $cmakePath = $autoPaths[0]
-            Write-Host "自动找到：$cmakePath"
-          }
+          $targetCmake = "$env:TARGET_PATH/CMakeLists.txt"
+          Write-Host "`n===== 检查目标路径：$targetCmake ====="
           
-          # 2. 自动搜索失败则尝试手动路径
-          if (-not $cmakePath) {
-            Write-Host "`n===== 自动搜索失败，尝试手动路径 ====="
-            $manualPaths = $env:MANUAL_TELEGRAM_PATHS -split "`n" | ForEach-Object { $_.Trim() }
-            foreach ($p in $manualPaths) {
-              $testPath = "$p/CMakeLists.txt"
-              if (Test-Path $testPath) {
-                $cmakePath = (Resolve-Path $testPath).Path
-                Write-Host "手动找到：$cmakePath"
-                break
-              }
-            }
+          if (Test-Path $targetCmake) {
+            $cmakePath = (Resolve-Path $targetCmake).Path
+            $telegramDir = Split-Path $cmakePath -Parent
+            echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
+            echo "TELEGRAM_DIR=$telegramDir" >> $env:GITHUB_ENV
+            Write-Host "✅ 找到目标文件：$cmakePath"
+          } else {
+            # 输出td/telegram下的实际文件，帮你确认缺失原因
+            Write-Host "`n===== td/telegram下的实际文件 ====="
+            Get-ChildItem -Path ./td/telegram -ErrorAction SilentlyContinue | Select-Object Name
+            throw "❌ 仍未找到$targetCmake！请查看上面的文件列表，确认该文件是否存在（可能子模块未拉取完整）"
           }
-          
-          # 3. 最终检查
-          if (-not $cmakePath) {
-            throw "`n❌ 仍未找到telegram/CMakeLists.txt！请确认你的项目中该文件的实际路径，然后在MANUAL_TELEGRAM_PATHS中添加。`n当前尝试的手动路径：`n$($env:MANUAL_TELEGRAM_PATHS)"
-          }
-          
-          # 保存路径
-          $telegramDir = Split-Path $cmakePath -Parent
-          echo "CMAKE_PATH=$cmakePath" >> $env:GITHUB_ENV
-          echo "TELEGRAM_DIR=$telegramDir" >> $env:GITHUB_ENV
 
       - name: 生成.def文件（易语言适配）
         run: |
@@ -81,9 +59,8 @@ jobs:
               td_json_client_receive@12
               td_json_client_execute@8
           "@ | Set-Content $defPath -Force
-          Write-Host "生成.def文件：$defPath"
 
-      - name: 修改CMake配置
+      - name: 修改td/telegram/CMakeLists.txt
         run: |
           $content = Get-Content $env:CMAKE_PATH -Raw
           $content = $content -replace 'TD_JSON_CLIENT_API', ''
@@ -119,5 +96,5 @@ jobs:
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: tdjson-easy-final
+          name: tdjson-easy-success
           path: ${{ env.BUILD_DIR }}/Release/*.dll
